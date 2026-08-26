@@ -49,7 +49,9 @@ def led_read():
 _log_file = None
 
 def log(msg):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    # 日本時間 (JST: UTC+9) でタイムスタンプを生成
+    jst_time = time.time() + 9 * 3600
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(jst_time))
     line = "[{}] {}\n".format(ts, msg)
     global _log_file
     if _log_file:
@@ -159,6 +161,7 @@ def skcommand(fd, cmd, timeout=10):
     t.daemon = True
     t.start()
 
+    log("CMD > {}".format(cmd))
     serial_write(fd, cmd + "\r\n")
     lines = []
     deadline = time.time() + timeout
@@ -167,6 +170,9 @@ def skcommand(fd, cmd, timeout=10):
             line = serial_readline(fd, timeout=max(0.5, deadline - time.time()))
             if line is None:
                 break
+            line_str = line.strip()
+            if line_str:
+                log("CMD < {}".format(line_str))
             lines.append(line)
             if line in ("OK", ) or line.startswith("FAIL"):
                 break
@@ -181,54 +187,114 @@ def skcommand(fd, cmd, timeout=10):
 # ---------------------------------------------------------------------------
 
 SCAN_DURATION_BASE = 4
-SCAN_RETRY_LIMIT = 10
+SCAN_RETRY_LIMIT = 7
 
 # ---------------------------------------------------------------------------
 # SKSTACK-IP / Wi-SUN B-route connection
 # ---------------------------------------------------------------------------
 
-def skscan(fd):
-    """Active scan with retries; returns best PAN info dict or empty dict."""
+def skscan(fd, target_pan_id=None, target_channel=None, target_addr=None):
+    """Active scan with retries; returns list of candidate PAN dicts (sorted by LQI desc)."""
     duration = SCAN_DURATION_BASE
     
     while duration <= SCAN_RETRY_LIMIT:
         # Clear stale lines from previous command/scan cycle.
         termios.tcflush(fd, termios.TCIFLUSH)
 
-        log("SKSCAN try duration={}".format(duration))
+        # Wi-SUN active scan time: ~20ms * (2^duration + 1) * 32 channels
+        # e.g. duration=4 -> ~11s, duration=5 -> ~21s, duration=6 -> ~42s
+        expected_sec = int(0.02 * (2**duration + 1) * 32)
+        timeout_sec  = expected_sec + 10
+
+        cmd = "SKSCAN 2 FFFFFFFF {} 0".format(duration)
+        log("SCAN > {} (waiting up to ~{}s for scan completion)".format(cmd, timeout_sec))
         # BP35C0 style scan command: <mode> <channel_mask> <duration> <side>
-        serial_write(fd, "SKSCAN 2 FFFFFFFF {} 0\r\n".format(duration))
+        serial_write(fd, cmd + "\r\n")
 
         pan_list  = []
         current   = {}
+        deadline  = time.time() + timeout_sec
         scan_done = False
-        deadline  = time.time() + duration
+
         while time.time() < deadline:
             line = serial_readline(fd, timeout=2)
             if line is None:
                 continue
-            if line.startswith("EVENT 20"):
+            line_clean = line.strip()
+            if line_clean:
+                log("SCAN < {}".format(line_clean))
+
+            if line_clean.startswith("EVENT 20"):
                 if current:
                     pan_list.append(current)
                 current = {}
-            elif line.startswith("EVENT 22"):
+            elif line_clean.startswith("EVENT 22"):
                 if current:
                     pan_list.append(current)
+                current = {}
                 scan_done = True
+                log("SKSCAN completed (EVENT 22 received)")
                 break  # Exit loop once EVENT 22 received
-            elif ":" in line and not line.startswith("EVENT"):
-                key, _, val = line.strip().partition(":")
+            elif ":" in line_clean and not line_clean.startswith("EVENT"):
+                key, _, val = line_clean.partition(":")
                 current[key.strip()] = val.strip()
 
-        if pan_list:
-            log("SKSCAN found {} PAN(s), selecting best LQI".format(len(pan_list)))
-            pan_list.sort(key=lambda p: int(p.get("LQI", "0"), 16), reverse=True)
-            return pan_list[0]
+        if current and current not in pan_list:
+            pan_list.append(current)
 
-        log("SKSCAN no PAN found, retrying with longer duration")
+        if pan_list:
+            log("SKSCAN found {} PAN(s):".format(len(pan_list)))
+            normalized_list = []
+            for i, p in enumerate(pan_list):
+                # キーの表記揺れを吸収 (Pan ID / PanID / pan_id など)
+                norm = {}
+                for k, v in p.items():
+                    kc = k.replace(" ", "").lower()
+                    if kc in ("channel", "ch"):
+                        norm["Channel"] = v
+                    elif kc in ("panid", "pan"):
+                        norm["Pan ID"] = v
+                    elif kc in ("addr", "mac"):
+                        norm["Addr"] = v
+                    elif kc == "lqi":
+                        norm["LQI"] = v
+                    else:
+                        norm[k] = v
+                normalized_list.append(norm)
+
+                extra = " ".join(["{}={}".format(k, v) for k, v in sorted(norm.items())
+                                 if k not in ("Channel", "Pan ID", "Addr", "LQI")])
+                log("  [{}] Channel={} Pan ID={} Addr={} LQI={}{}".format(
+                    i + 1,
+                    norm.get("Channel", "N/A"),
+                    norm.get("Pan ID", "N/A"),
+                    norm.get("Addr", "N/A"),
+                    norm.get("LQI", "N/A"),
+                    " " + extra if extra else ""
+                ))
+
+            # ターゲット指定がある場合はそれを先頭に優先配置、なければ全件LQI順
+            if target_pan_id or target_channel or target_addr:
+                matched = [p for p in normalized_list
+                           if (not target_pan_id or p.get("Pan ID", "").lower() == str(target_pan_id).lower())
+                           and (not target_channel or str(p.get("Channel", "")).lower() == str(target_channel).lower())
+                           and (not target_addr or p.get("Addr", "").lower() == str(target_addr).lower())]
+                unmatched = [p for p in normalized_list if p not in matched]
+                matched.sort(key=lambda p: int(p.get("LQI", "0"), 16), reverse=True)
+                unmatched.sort(key=lambda p: int(p.get("LQI", "0"), 16), reverse=True)
+                return matched + unmatched
+
+            # 見つかったPANはすべて電波強度順に全件試行対象とする
+            normalized_list.sort(key=lambda p: int(p.get("LQI", "0"), 16), reverse=True)
+            return normalized_list
+
+        if not scan_done:
+            log("SKSCAN timed out without EVENT 22, retrying with longer duration")
+        else:
+            log("SKSCAN finished but no matching PAN found, retrying with longer duration")
         duration += 1
 
-    return {}
+    return []
 
 def skll64(fd, mac):
     """Convert MAC address to IPv6 link-local address.
@@ -260,65 +326,91 @@ def skll64(fd, mac):
             continue
     return None
 
-def wisun_connect(fd, br_id, br_pwd):
+def wisun_connect(fd, br_id, br_pwd, target_pan_id=None, target_channel=None, target_addr=None):
     """Full SKSTACK-IP join sequence. Returns IPv6 address of meter."""
-    log("SKRESET")
+    log("Initializing Wi-SUN module...")
     skcommand(fd, "SKRESET", timeout=5)
     time.sleep(1)
 
-    log("SKSETPWD")
-    skcommand(fd, "SKSETPWD C {}".format(br_pwd))
+    skcommand(fd, "SKSETPWD C {}".format(br_pwd), timeout=5)
+    skcommand(fd, "SKSETRBID {}".format(br_id), timeout=5)
 
-    log("SKSETRBID")
-    skcommand(fd, "SKSETRBID {}".format(br_id))
+    # Force ASCII-hex ERXUDP payload format if supported (BP35A1/BP35C0 compatibility)
+    skcommand(fd, "WOPT 1", timeout=2)
 
-    # Force ASCII-hex ERXUDP payload format so parser stays stable.
-    skcommand(fd, "WOPT 1")
+    log("Starting Wi-SUN PAN Active Scan...")
+    pan_candidates = skscan(fd, target_pan_id=target_pan_id,
+                            target_channel=target_channel,
+                            target_addr=target_addr)
+    if not pan_candidates:
+        raise RuntimeError("SKSCAN: no candidate PAN found")
 
-    log("SKSCAN (may take up to 60s)")
-    pan = skscan(fd)
-    if not pan.get("Channel") or not pan.get("Pan ID") or not pan.get("Addr"):
-        raise RuntimeError("SKSCAN: no PAN found ({})".format(pan))
+    log("Testing connection to {} candidate PAN(s) in order of signal quality...".format(len(pan_candidates)))
 
-    channel = pan["Channel"]
-    pan_id  = pan["Pan ID"]
-    mac     = pan["Addr"]
-    log("PAN found: ch={} panId={} mac={}".format(channel, pan_id, mac))
+    for idx, pan in enumerate(pan_candidates):
+        channel = pan.get("Channel")
+        pan_id  = pan.get("Pan ID")
+        mac     = pan.get("Addr")
+        lqi     = pan.get("LQI", "N/A")
 
-    ipv6 = skll64(fd, mac)
-    if not ipv6:
-        raise RuntimeError("SKLL64 failed")
-    log("Meter IPv6: {}".format(ipv6))
+        if not channel or not pan_id or not mac:
+            log("Candidate [{}/{}] missing channel/pan_id/mac, skipping: {}".format(
+                idx + 1, len(pan_candidates), pan))
+            continue
 
-    skcommand(fd, "SKSREG S2 {}".format(channel))
-    skcommand(fd, "SKSREG S3 {}".format(pan_id))
+        log("--- Trying PAN [{}/{}]: Channel={} Pan ID={} Addr={} LQI={} ---".format(
+            idx + 1, len(pan_candidates), channel, pan_id, mac, lqi
+        ))
 
-    log("SKJOIN {}".format(ipv6))
-    serial_write(fd, "SKJOIN {}\r\n".format(ipv6))
+        ipv6 = skll64(fd, mac)
+        if not ipv6:
+            log("SKLL64 failed for PAN [{}/{}], skipping".format(idx + 1, len(pan_candidates)))
+            continue
 
-    orig_led = led_read()
-    stop_event = threading.Event()
-    t = threading.Thread(target=_led_blink,
-                         args=(stop_event, [(0, 255, 0), (0, 0, 255)]))
-    t.daemon = True
-    t.start()
-    try:
-        deadline = time.time() + 90
-        while time.time() < deadline:
-            line = serial_readline(fd, timeout=2)
-            if line is None:
-                continue
-            if "EVENT 25" in line:
-                log("SKJOIN: connected")
-                return ipv6
-            if "EVENT 24" in line:
-                raise RuntimeError("SKJOIN: PANA authentication failed (EVENT 24)")
-    finally:
-        stop_event.set()
-        t.join(timeout=1)
-        led_rgb(*orig_led)
+        skcommand(fd, "SKSREG S2 {}".format(channel))
+        skcommand(fd, "SKSREG S3 {}".format(pan_id))
 
-    raise RuntimeError("SKJOIN: timeout")
+        log("SKJOIN {} (Channel={} Pan ID={})".format(ipv6, channel, pan_id))
+        serial_write(fd, "SKJOIN {}\r\n".format(ipv6))
+
+        orig_led = led_read()
+        stop_event = threading.Event()
+        t = threading.Thread(target=_led_blink,
+                             args=(stop_event, [(0, 255, 0), (0, 0, 255)]))
+        t.daemon = True
+        t.start()
+
+        join_success = False
+        try:
+            deadline = time.time() + 45
+            while time.time() < deadline:
+                line = serial_readline(fd, timeout=2)
+                if line is None:
+                    continue
+                if "EVENT 25" in line:
+                    log("==================================================")
+                    log(">>> SKJOIN SUCCESS! Connected to PAN [{}/{}] <<<".format(idx + 1, len(pan_candidates)))
+                    log(">>> Channel: {} | Pan ID: {} | Addr: {} | LQI: {} <<<".format(channel, pan_id, mac, lqi))
+                    log(">>> Meter IPv6: {} <<<".format(ipv6))
+                    log(">>> Hint: Set \"target_pan_id\": \"{}\" in config.json to connect directly in future. <<<".format(pan_id))
+                    log("==================================================")
+                    join_success = True
+                    return ipv6
+                if "EVENT 24" in line:
+                    log("SKJOIN: PANA authentication failed (EVENT 24) for PAN [{}/{}]: Channel={} Pan ID={}".format(
+                        idx + 1, len(pan_candidates), channel, pan_id))
+                    break
+        finally:
+            stop_event.set()
+            t.join(timeout=1)
+            led_rgb(*orig_led)
+
+        if not join_success:
+            log("PAN [{}/{}] connection failed, trying next candidate...".format(
+                idx + 1, len(pan_candidates)))
+            time.sleep(1)
+
+    raise RuntimeError("SKJOIN: All candidate PAN connections failed")
 
 # ---------------------------------------------------------------------------
 # ECHONET Lite frame builder / parser
@@ -679,6 +771,8 @@ def main():
     global _log_file
     try:
         _log_file = open(LOG_PATH, "a")
+        _log_file.write("\n\n" + "=" * 80 + "\n")
+        _log_file.flush()
     except Exception:
         pass
 
@@ -692,8 +786,13 @@ def main():
     device_id     = cfg.get("device_id", "cubej1")
     serial_port   = cfg.get("serial_port", "/dev/ttyS1")
     poll_interval = int(cfg.get("poll_interval", 60))
+    target_pan_id = cfg.get("target_pan_id") or cfg.get("pan_id")
+    target_channel= cfg.get("target_channel") or cfg.get("channel")
+    target_addr   = cfg.get("target_addr") or cfg.get("addr")
 
-    log("=== mqtt_bridge start device_id={} ===".format(device_id))
+    log("================================================================================")
+    log("=== [START / RESTART] mqtt_bridge started (device_id={}) ===".format(device_id))
+    log("================================================================================")
 
     # Connect MQTT
     mqtt = MQTTClient(ha_host, ha_port, "cubej1_{}".format(device_id),
@@ -723,7 +822,10 @@ def main():
     ipv6 = None
     while True:
         try:
-            ipv6 = wisun_connect(fd, br_id, br_pwd)
+            ipv6 = wisun_connect(fd, br_id, br_pwd,
+                                 target_pan_id=target_pan_id,
+                                 target_channel=target_channel,
+                                 target_addr=target_addr)
             break
         except Exception as e:
             log("Wi-SUN join failed: {} - retry in 60s".format(e))
@@ -772,7 +874,10 @@ def main():
             log("Main loop error: {} - reconnecting Wi-SUN in 30s".format(e))
             time.sleep(30)
             try:
-                ipv6 = wisun_connect(fd, br_id, br_pwd)
+                ipv6 = wisun_connect(fd, br_id, br_pwd,
+                                     target_pan_id=target_pan_id,
+                                     target_channel=target_channel,
+                                     target_addr=target_addr)
                 log("Wi-SUN reconnected at {}".format(ipv6))
             except Exception as e2:
                 log("Wi-SUN reconnect failed: {}".format(e2))
