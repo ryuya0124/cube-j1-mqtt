@@ -273,7 +273,7 @@ def skscan(fd, target_pan_id=None, target_channel=None, target_addr=None):
                     " " + extra if extra else ""
                 ))
 
-            # ターゲット指定がある場合はそれを先頭に優先配置、なければ全件LQI順
+            # ターゲット指定がある場合
             if target_pan_id or target_channel or target_addr:
                 matched = [p for p in normalized_list
                            if (not target_pan_id or p.get("Pan ID", "").lower() == str(target_pan_id).lower())
@@ -282,9 +282,21 @@ def skscan(fd, target_pan_id=None, target_channel=None, target_addr=None):
                 unmatched = [p for p in normalized_list if p not in matched]
                 matched.sort(key=lambda p: int(p.get("LQI", "0"), 16), reverse=True)
                 unmatched.sort(key=lambda p: int(p.get("LQI", "0"), 16), reverse=True)
-                return matched + unmatched
 
-            # 見つかったPANはすべて電波強度順に全件試行対象とする
+                if matched:
+                    log("Target PAN matched! Prioritizing {} target PAN(s), with {} other PAN(s) as automatic fallback".format(
+                        len(matched), len(unmatched)))
+                    for p in matched: p["_is_target"] = True
+                    for p in unmatched: p["_is_target"] = False
+                    return matched + unmatched
+                else:
+                    log("Target PAN not found in scan results. Automatically testing all {} detected PAN(s)".format(
+                        len(unmatched)))
+                    for p in unmatched: p["_is_target"] = False
+                    return unmatched
+
+            # ターゲット未指定時は全件をLQI順に試行
+            for p in normalized_list: p["_is_target"] = False
             normalized_list.sort(key=lambda p: int(p.get("LQI", "0"), 16), reverse=True)
             return normalized_list
 
@@ -345,21 +357,23 @@ def wisun_connect(fd, br_id, br_pwd, target_pan_id=None, target_channel=None, ta
     if not pan_candidates:
         raise RuntimeError("SKSCAN: no candidate PAN found")
 
-    log("Testing connection to {} candidate PAN(s) in order of signal quality...".format(len(pan_candidates)))
+    log("Testing connection to {} candidate PAN(s) sequentially...".format(len(pan_candidates)))
 
     for idx, pan in enumerate(pan_candidates):
         channel = pan.get("Channel")
         pan_id  = pan.get("Pan ID")
         mac     = pan.get("Addr")
         lqi     = pan.get("LQI", "N/A")
+        is_tgt  = pan.get("_is_target", False)
 
         if not channel or not pan_id or not mac:
             log("Candidate [{}/{}] missing channel/pan_id/mac, skipping: {}".format(
                 idx + 1, len(pan_candidates), pan))
             continue
 
-        log("--- Trying PAN [{}/{}]: Channel={} Pan ID={} Addr={} LQI={} ---".format(
-            idx + 1, len(pan_candidates), channel, pan_id, mac, lqi
+        prefix = "[Target PAN]" if is_tgt else "[Fallback PAN]"
+        log("--- Trying PAN [{}/{}]{}: Channel={} Pan ID={} Addr={} LQI={} ---".format(
+            idx + 1, len(pan_candidates), " " + prefix if target_pan_id else "", channel, pan_id, mac, lqi
         ))
 
         ipv6 = skll64(fd, mac)
@@ -406,8 +420,12 @@ def wisun_connect(fd, br_id, br_pwd, target_pan_id=None, target_channel=None, ta
             led_rgb(*orig_led)
 
         if not join_success:
-            log("PAN [{}/{}] connection failed, trying next candidate...".format(
-                idx + 1, len(pan_candidates)))
+            if is_tgt:
+                log("Target PAN [{}/{}] (Pan ID={}) failed. Automatically trying remaining detected PANs...".format(
+                    idx + 1, len(pan_candidates), pan_id))
+            else:
+                log("PAN [{}/{}] connection failed, trying next candidate...".format(
+                    idx + 1, len(pan_candidates)))
             time.sleep(1)
 
     raise RuntimeError("SKJOIN: All candidate PAN connections failed")
