@@ -80,6 +80,9 @@ Cube J1 は USB メモリ内の特定ファイル構成を検出すると自動�
 | `device_id` | HA 上のデバイス識別子。 |
 | `serial_port` | Wi-SUN モジュールのシリアルデバイス指定。通常は変更不要（`/dev/ttyS1`） |
 | `poll_interval` | スマートメーターへデータを取得しに行くポーリング間隔（秒） |
+| `target_pan_id` | （任意）接続対象の PAN ID。アパート等の集合住宅で特定のPANに接続したい場合に指定 |
+| `target_channel` | （任意）接続対象のチャンネル番号 |
+| `target_addr` | （任意）接続対象の MAC アドレス（16進文字列） |
 
 ## LED のステータス表示
 
@@ -128,8 +131,8 @@ production_tool/
 - **依存ライブラリ**: Python 2.7 標準ライブラリのみを使用（`termios`, `socket`, `struct`, `select`, `json`, `threading` など）。`pyserial` や `paho-mqtt` 等の外部ライブラリは不要です。
 - **シリアル通信**: `termios` にて raw モードを設定し、115200 bps で通信します。
 - **MQTT 実装**: MQTT 3.1.1 の仕様に基づきソケット通信を用いて独自実装（QoS 0、TCP keepalive 対応、自動再接続機能あり）。
-- **Wi-SUN 接続**: PAN スキャンを実行し、最も LQI（リンク品質）の良い PAN を自動選択します。
-- **動作ログ**: ブリッジの動作ログは本体内の `/data/local/mqtt_bridge.log` に追記されます。
+- **Wi-SUN 接続**: PAN スキャンで検出されたすべての PAN を電波強度順に自動で順次接続試行（アパート等で近隣の他メーターが強い場合も、認証成功するまで順番にトライ）。`config.json` にて特定の PAN ID 等に固定することも可能。
+- **動作ログ**: ブリッジの動作ログは日本時間（JST）で本体内の `/data/local/mqtt_bridge.log` に追記されます。検出されたすべての PAN 情報や接続成功した PAN も明記されます。
 
 ### MQTT トピック構造
 
