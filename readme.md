@@ -86,6 +86,8 @@ USB メモリを挿したまま起動するとセットアップスクリプト�
 | `target_channel` | （任意）実測したチャンネル番号。以下の3項目がすべてある場合は30分に1回まで直接接続を試し、失敗時は通常走査に戻ります |
 | `target_addr` | （任意）実測したメーターの MAC アドレス（16進文字列） |
 
+メーターが見つからない場合は、Wi-SUN 走査の間隔を1分から最大5分まで段階的に延ばします。
+
 ### SSH による復旧アクセス
 
 USB の `production_tool/ssh/authorized_keys` に接続元の公開鍵を置くと、USB 挿入時に Cube J1 の SSH をポート `22` で起動します。パスワード認証は無効です。このファイルは Git の管理対象外です。Mac の鍵を使う場合は `cp ~/.ssh/id_ed25519.pub production_tool/ssh/authorized_keys` としてから USB にコピーしてください。接続は `ssh root@192.168.3.33` です。起動の記録は Cube J1 の `/data/local/ssh/setup.log` に残ります。

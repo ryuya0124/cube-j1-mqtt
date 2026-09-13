@@ -892,6 +892,7 @@ def main():
 
     # Wi-SUN join
     ipv6 = None
+    join_failures = 0
     while True:
         try:
             ipv6 = wisun_connect(fd, br_id, br_pwd,
@@ -900,8 +901,10 @@ def main():
                                  target_addr=target_addr)
             break
         except Exception as e:
-            log("Wi-SUN join failed: {} - retry in 60s".format(e))
-            time.sleep(60)
+            join_failures += 1
+            retry_after = min(join_failures * 60, 300)
+            log("Wi-SUN join failed: {} - retry in {}s".format(e, retry_after))
+            time.sleep(retry_after)
 
     log("Meter connected at {}".format(ipv6))
 
