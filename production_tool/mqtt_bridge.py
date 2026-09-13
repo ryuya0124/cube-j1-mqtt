@@ -295,7 +295,7 @@ def skscan(fd, expected_pair_id, target_pan_id=None, target_channel=None, target
 
             for i, norm in enumerate(eligible):
                 extra = " ".join(["{}={}".format(k, v) for k, v in sorted(norm.items())
-                                 if k not in ("Channel", "Pan ID", "Addr", "LQI")])
+                                 if k not in ("Channel", "Pan ID", "Addr", "LQI", "PairID")])
                 log("  [{}] Channel={} Pan ID={} Addr={} LQI={}{}".format(
                     i + 1,
                     norm.get("Channel", "N/A"),
