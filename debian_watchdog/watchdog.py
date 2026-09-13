@@ -62,8 +62,10 @@ def radio_search_active():
               "test $(( $(date +%s) - $(stat -c %Y /data/local/mqtt_bridge.log) )) -lt 300 && "
               "tail -n 50 /data/local/mqtt_bridge.log | "
               "grep -q 'SKSCAN completed (EVENT 22 received)' && "
-              "tail -n 50 /data/local/mqtt_bridge.log | "
-              "grep -q 'Wi-SUN join failed: SKSCAN: no candidate PAN found'")
+              "tail -n 250 /data/local/mqtt_bridge.log | "
+              "grep -q 'Wi-SUN join failed: SKSCAN: no candidate PAN found' && "
+              "! tail -n 50 /data/local/mqtt_bridge.log | "
+              "grep -Eq 'Meter connected at|Measurements:'")
     try:
         result = subprocess.run(ssh_command() + [remote], capture_output=True,
                                 text=True, timeout=10)
