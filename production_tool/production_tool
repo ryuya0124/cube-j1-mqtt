@@ -27,6 +27,9 @@ chmod 755 /data/local/mqtt_bridge.py
 # make root filesystem writable so we can update init RC files
 mount -o rw,remount /
 
+# Start key-only SSH as a recovery path when adbd stops responding.
+/system/bin/sh "$PT/ssh/setup_ssh.sh"
+
 # disable wisund (it holds /dev/ttyS1 and blocks our bridge)
 cp $PT/wisund_disabled.rc /system/etc/init/wisund.rc
 

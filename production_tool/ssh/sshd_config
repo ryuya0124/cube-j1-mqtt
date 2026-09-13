@@ -1,0 +1,12 @@
+Port 22
+Protocol 2
+HostKey /data/local/ssh/ssh_host_ed25519_key
+PidFile /data/local/ssh/sshd.pid
+PermitRootLogin yes
+PubkeyAuthentication yes
+AuthorizedKeysFile /root/.ssh/authorized_keys
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+UsePAM no
+PermitEmptyPasswords no
+AllowUsers root

@@ -82,9 +82,15 @@ USB メモリを挿したまま起動するとセットアップスクリプト�
 | `device_id` | HA 上のデバイス識別子。 |
 | `serial_port` | Wi-SUN モジュールのシリアルデバイス指定。通常は変更不要（`/dev/ttyS1`） |
 | `poll_interval` | スマートメーターへデータを取得しに行くポーリング間隔（秒） |
-| `target_pan_id` | （任意）接続対象の PAN ID。アパート等の集合住宅で特定のPANに接続したい場合に指定 |
-| `target_channel` | （任意）接続対象のチャンネル番号 |
-| `target_addr` | （任意）接続対象の MAC アドレス（16進文字列） |
+| `target_pan_id` | （任意）接続対象の PAN ID |
+| `target_channel` | （任意）実測したチャンネル番号。以下の3項目がすべてある場合は30分に1回まで直接接続を試し、失敗時は通常走査に戻ります |
+| `target_addr` | （任意）実測したメーターの MAC アドレス（16進文字列） |
+
+### SSH による復旧アクセス
+
+USB の `production_tool/ssh/authorized_keys` に接続元の公開鍵を置くと、USB 挿入時に Cube J1 の SSH をポート `22` で起動します。パスワード認証は無効です。このファイルは Git の管理対象外です。Mac の鍵を使う場合は `cp ~/.ssh/id_ed25519.pub production_tool/ssh/authorized_keys` としてから USB にコピーしてください。接続は `ssh root@192.168.3.33` です。起動の記録は Cube J1 の `/data/local/ssh/setup.log` に残ります。
+
+同梱の ARM ライブラリ `libcrypto.so.1.0.0` は [Debian archive の ARMHF パッケージ](https://archive.debian.org/debian/pool/main/o/openssl/libcrypto1.0.0-udeb_1.0.2l-1~bpo8+1_armhf.udeb) から抽出したもので、SHA-256 は `5d1b68871af600e6501f3f824f8e230074041cb9c259814e219201d8c87c7fc4` です。Cube J1 に元からある `/usr/sbin/sshd` が必要とする場合だけ `/lib` へコピーします。
 
 ## LED のステータス表示
 
@@ -107,11 +113,12 @@ USB メモリ挿入時に Cube J1 が自動実行するメインスクリプト�
 
 1. **ADB の TCP 有効化**: ポート `5555` で ADB 接続を受け付けるように設定
 2. **Wi-Fi 設定**: `wpa_supplicant.conf` をシステムに配置してネットワークを再起動
-3. **ブリッジプログラムの配置**: `config.json` と `mqtt_bridge.py` を `/data/local/` ディレクトリへコピー
-4. **競合サービスの停止**: Wi-SUN モジュール（`/dev/ttyS1`）を占有してしまう既存サービス（`wisund`、`NDEcLiteAgent`）を停止し、以後の起動を無効化
-5. **init サービスの登録**: 再起動後もプログラムが自動起動するよう、`mqtt_ha_bridge.rc` を `/system/etc/init/` へ配置
-6. **ブリッジ即時起動**: `mqtt_ha_bridge` サービスとして `mqtt_bridge.py` を起動開始
-7. **完了通知**: `led_effect.sh` を呼び出し、LED を点滅させてセットアップ完了を通知
+3. **SSH の起動**: `ssh/authorized_keys` があれば公開鍵認証だけを許可する SSH をポート `22` で起動
+4. **ブリッジプログラムの配置**: `config.json` と `mqtt_bridge.py` を `/data/local/` ディレクトリへコピー
+5. **競合サービスの停止**: Wi-SUN モジュール（`/dev/ttyS1`）を占有してしまう既存サービス（`wisund`、`NDEcLiteAgent`）を停止し、以後の起動を無効化
+6. **init サービスの登録**: 再起動後もプログラムが自動起動するよう、`mqtt_ha_bridge.rc` を `/system/etc/init/` へ配置
+7. **ブリッジ即時起動**: `mqtt_ha_bridge` サービスとして `mqtt_bridge.py` を起動開始
+8. **完了通知**: `led_effect.sh` を呼び出し、LED を点滅させてセットアップ完了を通知
 
 ### ファイル構成
 
@@ -124,7 +131,8 @@ production_tool/
 ├── wpa_supplicant.conf      # Wi-Fi の接続先情報を指定する設定ファイル（要編集）
 ├── mqtt_ha_bridge.rc        # ブート時にブリッジを自動起動させるための init スクリプト
 ├── wisund_disabled.rc       # 標準の wisund サービスを無効化するための RC ファイル
-└── ndeclite_disabled.rc     # 標準の NDEcLiteAgent を無効化するための RC ファイル
+├── ndeclite_disabled.rc     # 標準の NDEcLiteAgent を無効化するための RC ファイル
+└── ssh/                     # 公開鍵認証のみの SSH 起動ファイル
 ```
 
 ### 技術仕様詳細

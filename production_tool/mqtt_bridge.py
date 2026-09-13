@@ -193,6 +193,8 @@ def skcommand(fd, cmd, timeout=10):
 SCAN_DURATION_BASE = 4
 SCAN_RETRY_LIMIT = 7
 NO_RESPONSE_REJOIN_COUNT = 6
+DIRECT_JOIN_RETRY_INTERVAL = 1800
+_last_direct_join_at = 0
 
 # ---------------------------------------------------------------------------
 # SKSTACK-IP / Wi-SUN B-route connection
@@ -345,6 +347,7 @@ def skll64(fd, mac):
 
 def wisun_connect(fd, br_id, br_pwd, target_pan_id=None, target_channel=None, target_addr=None):
     """Full SKSTACK-IP join sequence. Returns IPv6 address of meter."""
+    global _last_direct_join_at
     log("Initializing Wi-SUN module...")
     skcommand(fd, "SKRESET", timeout=5)
     time.sleep(1)
@@ -354,6 +357,42 @@ def wisun_connect(fd, br_id, br_pwd, target_pan_id=None, target_channel=None, ta
 
     # Force ASCII-hex ERXUDP payload format if supported (BP35A1/BP35C0 compatibility)
     skcommand(fd, "WOPT 1", timeout=2)
+
+    # A previously verified meter can be tried without waiting for a beacon.
+    # Rate-limit this path because repeated PANA attempts can burden the meter.
+    now = time.time()
+    if (target_pan_id and target_channel and target_addr and
+            now - _last_direct_join_at >= DIRECT_JOIN_RETRY_INTERVAL):
+        _last_direct_join_at = now
+        log("Trying configured meter directly: Channel={} Pan ID={} Addr={}".format(
+            target_channel, target_pan_id, target_addr))
+        ipv6 = skll64(fd, target_addr)
+        if ipv6:
+            skcommand(fd, "SKSREG S2 {}".format(target_channel))
+            skcommand(fd, "SKSREG S3 {}".format(target_pan_id))
+            serial_write(fd, "SKJOIN {}\r\n".format(ipv6))
+            deadline = time.time() + 45
+            while time.time() < deadline:
+                line = serial_readline(fd, timeout=2)
+                if line is None:
+                    continue
+                if "EVENT 25" in line:
+                    log("Direct SKJOIN succeeded: Channel={} Pan ID={}".format(
+                        target_channel, target_pan_id))
+                    return ipv6
+                if "EVENT 24" in line:
+                    log("Direct SKJOIN authentication failed (EVENT 24)")
+                    break
+            else:
+                log("Direct SKJOIN timed out")
+        else:
+            log("Direct SKLL64 failed")
+        log("Falling back to active scan")
+        skcommand(fd, "SKRESET", timeout=5)
+        time.sleep(1)
+        skcommand(fd, "SKSETPWD C {}".format(br_pwd), timeout=5)
+        skcommand(fd, "SKSETRBID {}".format(br_id), timeout=5)
+        skcommand(fd, "WOPT 1", timeout=2)
 
     log("Starting Wi-SUN PAN Active Scan...")
     pan_candidates = skscan(fd, target_pan_id=target_pan_id,
