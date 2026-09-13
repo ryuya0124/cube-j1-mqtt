@@ -161,7 +161,9 @@ def skcommand(fd, cmd, timeout=10):
     t.daemon = True
     t.start()
 
-    log("CMD > {}".format(cmd))
+    # B-route credentials are echoed by the module; never persist them in logs.
+    sensitive = cmd.startswith("SKSETPWD ") or cmd.startswith("SKSETRBID ")
+    log("CMD > {}".format(cmd.split()[0] + " [redacted]" if sensitive else cmd))
     serial_write(fd, cmd + "\r\n")
     lines = []
     deadline = time.time() + timeout
@@ -172,7 +174,9 @@ def skcommand(fd, cmd, timeout=10):
                 break
             line_str = line.strip()
             if line_str:
-                log("CMD < {}".format(line_str))
+                log("CMD < {}".format(line_str.split()[0] + " [redacted]"
+                                      if sensitive and line_str.startswith(cmd.split()[0] + " ")
+                                      else line_str))
             lines.append(line)
             if line in ("OK", ) or line.startswith("FAIL"):
                 break
@@ -188,6 +192,7 @@ def skcommand(fd, cmd, timeout=10):
 
 SCAN_DURATION_BASE = 4
 SCAN_RETRY_LIMIT = 7
+NO_RESPONSE_REJOIN_COUNT = 6
 
 # ---------------------------------------------------------------------------
 # SKSTACK-IP / Wi-SUN B-route connection
@@ -855,6 +860,7 @@ def main():
     coeff     = 1
     unit_kwh  = 1.0
     last_ping = time.time()
+    consecutive_no_response = 0
 
     while True:
         try:
@@ -865,6 +871,7 @@ def main():
                 tid = (tid + 1) & 0xFFFF
                 data = read_erxudp(fd, timeout=15)
                 if data:
+                    consecutive_no_response = 0
                     props = parse_el_response(data)
                     m     = decode_measurements(props)
                     m     = apply_energy_scale(m, coeff, unit_kwh)
@@ -878,7 +885,12 @@ def main():
                                    "current_r_a", "current_t_a")}))
                     publish_measurements(mqtt, device_id, m)
                 else:
-                    log("No ERXUDP response (timeout)")
+                    consecutive_no_response += 1
+                    log("No ERXUDP response (timeout; consecutive={}/{})".format(
+                        consecutive_no_response, NO_RESPONSE_REJOIN_COUNT))
+                    if consecutive_no_response >= NO_RESPONSE_REJOIN_COUNT:
+                        raise RuntimeError("{} consecutive meter response timeouts".format(
+                            consecutive_no_response))
             finally:
                 led_rgb(*orig_led)
 
@@ -896,6 +908,7 @@ def main():
                                      target_pan_id=target_pan_id,
                                      target_channel=target_channel,
                                      target_addr=target_addr)
+                consecutive_no_response = 0
                 log("Wi-SUN reconnected at {}".format(ipv6))
             except Exception as e2:
                 log("Wi-SUN reconnect failed: {}".format(e2))

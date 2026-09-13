@@ -1,0 +1,27 @@
+services:
+  watchdog:
+    build: .
+    container_name: cube-j1-watchdog
+    restart: unless-stopped
+    # Share the Debian host's ADB server; Cube J1 rejects a second ADB session.
+    network_mode: host
+    user: "1000:1000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./data:/data
+      - ./secrets/mqtt.json:/run/secrets/mqtt.json:ro
+    environment:
+      TZ: Asia/Tokyo
+      CUBE_IP: 192.168.3.33
+      STALE_AFTER: 600
+      BRIDGE_GRACE: 420
+      REBOOT_GRACE: 600
+      COOLDOWN: 3600
+      MAX_BRIDGE_PER_DAY: 4
+      MAX_REBOOT_PER_DAY: 2

@@ -132,7 +132,8 @@ production_tool/
 - **シリアル通信**: `termios` にて raw モードを設定し、115200 bps で通信します。
 - **MQTT 実装**: MQTT 3.1.1 の仕様に基づきソケット通信を用いて独自実装（QoS 0、TCP keepalive 対応、自動再接続機能あり）。
 - **Wi-SUN 接続**: PAN スキャンで検出されたすべての PAN を電波強度順に自動で順次接続試行（アパート等で近隣の他メーターが強い場合も、認証成功するまで順番にトライ）。`config.json` にて特定の PAN ID 等に固定することも可能。
-- **動作ログ**: ブリッジの動作ログは日本時間（JST）で本体内の `/data/local/mqtt_bridge.log` に追記されます。検出されたすべての PAN 情報や接続成功した PAN も明記されます。
+- **Wi-SUN 自動復旧**: スマートメーターからの応答が6回連続でタイムアウトした場合、Wi-SUN を初期化して PAN を再スキャン・再接続します。単発のタイムアウトでは再接続しません。
+- **動作ログ**: ブリッジの動作ログは日本時間（JST）で本体内の `/data/local/mqtt_bridge.log` に追記されます。検出された PAN 情報や接続成功した PAN、連続タイムアウト回数も記録します。B ルート認証情報はコマンドログで伏せます。
 
 ### MQTT トピック構造
 
@@ -144,6 +145,10 @@ production_tool/
 | 積算電力量（逆方向） | `cubej/{device_id}/energy_reverse` |
 | 瞬時電流 R相 | `cubej/{device_id}/current_r` |
 | 瞬時電流 T相 | `cubej/{device_id}/current_t` |
+
+### Debian 側の監視
+
+MQTT の更新停止を監視し、ブリッジ再起動から本体再起動へ段階的に復旧する任意の Docker サービスは [debian_watchdog](debian_watchdog/README.md) を参照してください。通常時は MQTT 購読のみ行い、Cube J1 にはアクセスしません。
 
 ## 参考記事
 
