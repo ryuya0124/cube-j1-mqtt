@@ -48,11 +48,32 @@ def adb(*args, timeout=15):
     return result.stdout.strip()
 
 
-def recover_ssh(action):
-    command = ["ssh", "-i", str(SSH_KEY), "-o", "BatchMode=yes",
+def ssh_command():
+    return ["ssh", "-i", str(SSH_KEY), "-o", "BatchMode=yes",
                "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
                "-o", "UserKnownHostsFile=" + str(SSH_KNOWN_HOSTS),
                "-o", "ConnectTimeout=5", "root@" + CUBE_IP]
+
+
+def radio_search_active():
+    """True only while Cube and its Wi-SUN module are still completing scans."""
+    remote = ("p=$(pgrep -f '[m]qtt_bridge.py' | head -n 1); "
+              "test -n \"$p\" && "
+              "test $(( $(date +%s) - $(stat -c %Y /data/local/mqtt_bridge.log) )) -lt 300 && "
+              "tail -n 50 /data/local/mqtt_bridge.log | "
+              "grep -q 'SKSCAN completed (EVENT 22 received)' && "
+              "tail -n 50 /data/local/mqtt_bridge.log | "
+              "grep -q 'Wi-SUN join failed: SKSCAN: no candidate PAN found'")
+    try:
+        result = subprocess.run(ssh_command() + [remote], capture_output=True,
+                                text=True, timeout=10)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def recover_ssh(action):
+    command = ssh_command()
 
     def run(remote, timeout=12):
         result = subprocess.run(command + [remote], capture_output=True,
@@ -173,15 +194,27 @@ def main():
                 now = time.time()
                 before = policy.phase
                 action, reason = policy.decide(now, broker_since, started_at)
-                if action:
-                    policy.start_action(action, now)
-                    save_state(policy)
-                elif policy.phase != before:
+                if policy.phase != before:
                     save_state(policy)
             if reason and not action:
                 event("recovery_deferred", reason=reason, until=policy.cooldown_until)
             if not action:
                 continue
+            if radio_search_active():
+                with lock:
+                    current, _ = policy.decide(time.time(), broker_since, started_at)
+                    if current == action:
+                        policy.defer_for_radio_search(time.time())
+                        save_state(policy)
+                        event("recovery_deferred", reason="Wi-SUN scan is responsive; meter not found",
+                              action=action, until=policy.cooldown_until)
+                continue
+            with lock:
+                current, reason = policy.decide(time.time(), broker_since, started_at)
+                if current != action:
+                    continue
+                policy.start_action(action, time.time())
+                save_state(policy)
             event("recovery_requested", action=action, reason=reason)
             try:
                 method = recover(action)

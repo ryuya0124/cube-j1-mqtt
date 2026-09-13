@@ -91,3 +91,9 @@ class Policy:
         if self.phase == expected:
             self.phase = "cooldown"
             self.cooldown_until = now + min(self.cooldown, 900)
+
+    def defer_for_radio_search(self, now):
+        """Let a responsive Wi-SUN scan continue without restarting Cube."""
+        self.phase = "cooldown"
+        self.phase_at = now
+        self.cooldown_until = now + min(self.cooldown, 900)

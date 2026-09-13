@@ -35,6 +35,16 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(p.phase, "cooldown")
         self.assertGreaterEqual(p.cooldown_until, 2 + 24 * 3600)
 
+    def test_responsive_radio_scan_defers_restarts(self):
+        p = Policy(stale_after=100, cooldown=3600)
+        self.assertEqual(p.decide(100, broker_since=0, started_at=0)[0], "bridge")
+        p.defer_for_radio_search(100)
+        self.assertEqual(p.decide(500, broker_since=0, started_at=0)[0], None)
+        self.assertEqual(p.decide(1000, broker_since=0, started_at=0)[0], "bridge")
+        self.assertEqual(p.actions, [])
+        p.observe(1001)
+        self.assertEqual(p.phase, "normal")
+
 
 if __name__ == "__main__":
     unittest.main()
