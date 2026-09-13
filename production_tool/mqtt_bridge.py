@@ -201,8 +201,8 @@ _last_direct_join_at = 0
 # SKSTACK-IP / Wi-SUN B-route connection
 # ---------------------------------------------------------------------------
 
-def skscan(fd, target_pan_id=None, target_channel=None, target_addr=None):
-    """Active scan with retries; returns list of candidate PAN dicts (sorted by LQI desc)."""
+def skscan(fd, expected_pair_id, target_pan_id=None, target_channel=None, target_addr=None):
+    """Return only PANs belonging to the configured B-route meter."""
     duration = SCAN_DURATION_BASE
     
     while duration <= SCAN_RETRY_LIMIT:
@@ -230,7 +230,11 @@ def skscan(fd, target_pan_id=None, target_channel=None, target_addr=None):
                 continue
             line_clean = line.strip()
             if line_clean:
-                log("SCAN < {}".format(line_clean))
+                # The raw scan can contain neighboring meters' identifiers.
+                if line_clean.startswith(("Pan ID:", "Addr:", "PairID:")):
+                    log("SCAN < {} [redacted]".format(line_clean.split(":", 1)[0] + ":"))
+                else:
+                    log("SCAN < {}".format(line_clean))
 
             if line_clean.startswith("EVENT 20"):
                 if current:
@@ -251,7 +255,6 @@ def skscan(fd, target_pan_id=None, target_channel=None, target_addr=None):
             pan_list.append(current)
 
         if pan_list:
-            log("SKSCAN found {} PAN(s):".format(len(pan_list)))
             normalized_list = []
             for i, p in enumerate(pan_list):
                 # キーの表記揺れを吸収 (Pan ID / PanID / pan_id など)
@@ -266,10 +269,31 @@ def skscan(fd, target_pan_id=None, target_channel=None, target_addr=None):
                         norm["Addr"] = v
                     elif kc == "lqi":
                         norm["LQI"] = v
+                    elif kc in ("pairid", "pairingid"):
+                        norm["PairID"] = v
                     else:
                         norm[k] = v
                 normalized_list.append(norm)
 
+            # A scan may see other meters in an apartment building. Never
+            # authenticate to an unrelated PAN or log its identifiers.
+            eligible = []
+            for pan in normalized_list:
+                if pan.get("PairID", "").upper() != expected_pair_id.upper():
+                    continue
+                if target_pan_id and pan.get("Pan ID", "").upper() != str(target_pan_id).upper():
+                    continue
+                if target_addr and pan.get("Addr", "").upper() != str(target_addr).upper():
+                    continue
+                eligible.append(pan)
+            log("SKSCAN received {} PAN(s), {} match the configured meter".format(
+                len(normalized_list), len(eligible)))
+            if not eligible:
+                log("No authorized meter in scan results; retrying with longer duration")
+                duration += 1
+                continue
+
+            for i, norm in enumerate(eligible):
                 extra = " ".join(["{}={}".format(k, v) for k, v in sorted(norm.items())
                                  if k not in ("Channel", "Pan ID", "Addr", "LQI")])
                 log("  [{}] Channel={} Pan ID={} Addr={} LQI={}{}".format(
@@ -281,32 +305,11 @@ def skscan(fd, target_pan_id=None, target_channel=None, target_addr=None):
                     " " + extra if extra else ""
                 ))
 
-            # ターゲット指定がある場合
-            if target_pan_id or target_channel or target_addr:
-                matched = [p for p in normalized_list
-                           if (not target_pan_id or p.get("Pan ID", "").lower() == str(target_pan_id).lower())
-                           and (not target_channel or str(p.get("Channel", "")).lower() == str(target_channel).lower())
-                           and (not target_addr or p.get("Addr", "").lower() == str(target_addr).lower())]
-                unmatched = [p for p in normalized_list if p not in matched]
-                matched.sort(key=lambda p: int(p.get("LQI", "0"), 16), reverse=True)
-                unmatched.sort(key=lambda p: int(p.get("LQI", "0"), 16), reverse=True)
-
-                if matched:
-                    log("Target PAN matched! Prioritizing {} target PAN(s), with {} other PAN(s) as automatic fallback".format(
-                        len(matched), len(unmatched)))
-                    for p in matched: p["_is_target"] = True
-                    for p in unmatched: p["_is_target"] = False
-                    return matched + unmatched
-                else:
-                    log("Target PAN not found in scan results. Automatically testing all {} detected PAN(s)".format(
-                        len(unmatched)))
-                    for p in unmatched: p["_is_target"] = False
-                    return unmatched
-
-            # ターゲット未指定時は全件をLQI順に試行
-            for p in normalized_list: p["_is_target"] = False
-            normalized_list.sort(key=lambda p: int(p.get("LQI", "0"), 16), reverse=True)
-            return normalized_list
+            # The channel can change without changing the meter's identity.
+            for pan in eligible:
+                pan["_is_target"] = True
+            eligible.sort(key=lambda p: int(p.get("LQI", "0"), 16), reverse=True)
+            return eligible
 
         if not scan_done:
             log("SKSCAN timed out without EVENT 22, retrying with longer duration")
@@ -405,7 +408,7 @@ def wisun_connect(fd, br_id, br_pwd, target_pan_id=None, target_channel=None, ta
         skcommand(fd, "WOPT 1", timeout=2)
 
     log("Starting Wi-SUN PAN Active Scan...")
-    pan_candidates = skscan(fd, target_pan_id=target_pan_id,
+    pan_candidates = skscan(fd, br_id[-8:], target_pan_id=target_pan_id,
                             target_channel=target_channel,
                             target_addr=target_addr)
     if not pan_candidates:
