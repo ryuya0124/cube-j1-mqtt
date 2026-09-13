@@ -905,7 +905,9 @@ def main():
             break
         except Exception as e:
             join_failures += 1
-            retry_after = min(join_failures * 60, 300)
+            # A missing meter can persist for hours. Avoid continuous radio
+            # scanning and repeated module resets during a long outage.
+            retry_after = min(60 * (2 ** min(join_failures - 1, 4)), 900)
             log("Wi-SUN join failed: {} - retry in {}s".format(e, retry_after))
             time.sleep(retry_after)
 
