@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 production_tool/ssh/authorized_keys
+debian_watchdog/secrets/

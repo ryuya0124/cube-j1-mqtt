@@ -20,6 +20,8 @@ from policy import Policy
 DATA = Path("/data")
 STATE = DATA / "state.json"
 SECRET = Path("/run/secrets/mqtt.json")
+SSH_KEY = Path("/run/secrets/cube_ssh_key")
+SSH_KNOWN_HOSTS = Path("/run/secrets/cube_known_hosts")
 CUBE_IP = os.environ.get("CUBE_IP", "192.168.3.33")
 SERIAL = CUBE_IP + ":5555"
 
@@ -46,19 +48,50 @@ def adb(*args, timeout=15):
     return result.stdout.strip()
 
 
-def recover(action):
-    connection = adb("connect", SERIAL, timeout=12)
-    if "failed" in connection.lower() or "unable" in connection.lower():
-        raise RuntimeError(connection[:240])
-    model = adb("-s", SERIAL, "shell", "getprop", "ro.product.model", timeout=10)
+def recover_ssh(action):
+    command = ["ssh", "-i", str(SSH_KEY), "-o", "BatchMode=yes",
+               "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
+               "-o", "UserKnownHostsFile=" + str(SSH_KNOWN_HOSTS),
+               "-o", "ConnectTimeout=5", "root@" + CUBE_IP]
+
+    def run(remote, timeout=12):
+        result = subprocess.run(command + [remote], capture_output=True,
+                                text=True, timeout=timeout)
+        if result.returncode:
+            raise RuntimeError((result.stderr or result.stdout).strip()[:240] or "ssh failed")
+        return result.stdout.strip()
+
+    model = run("/system/bin/getprop ro.product.model")
     if model.lower() != "cubej":
-        raise RuntimeError("unexpected ADB model: {}".format(model[:80]))
+        raise RuntimeError("unexpected SSH model: {}".format(model[:80]))
+    if action == "bridge":
+        run("/system/bin/setprop ctl.restart mqtt_ha_bridge")
+    elif action == "reboot":
+        run("/system/bin/sh -c 'sleep 2; /system/bin/reboot' </dev/null >/dev/null 2>&1 &")
+    else:
+        raise ValueError(action)
+
+
+def recover(action):
+    try:
+        connection = adb("connect", SERIAL, timeout=12)
+        if "failed" in connection.lower() or "unable" in connection.lower():
+            raise RuntimeError(connection[:240])
+        model = adb("-s", SERIAL, "shell", "getprop", "ro.product.model", timeout=10)
+        if model.lower() != "cubej":
+            raise RuntimeError("unexpected ADB model: {}".format(model[:80]))
+    except Exception as exc:
+        event("adb_unavailable", error=str(exc)[:240], fallback="ssh")
+        recover_ssh(action)
+        return "ssh"
+
     if action == "bridge":
         adb("-s", SERIAL, "shell", "setprop", "ctl.restart", "mqtt_ha_bridge", timeout=10)
     elif action == "reboot":
         adb("-s", SERIAL, "reboot", timeout=10)
     else:
         raise ValueError(action)
+    return "adb"
 
 
 def main():
@@ -151,14 +184,14 @@ def main():
                 continue
             event("recovery_requested", action=action, reason=reason)
             try:
-                recover(action)
+                method = recover(action)
             except Exception as exc:
                 with lock:
                     policy.action_failed(action, time.time())
                     save_state(policy)
                 event("recovery_failed", action=action, error=str(exc)[:240])
             else:
-                event("recovery_command_sent", action=action)
+                event("recovery_command_sent", action=action, method=method)
     finally:
         client.loop_stop()
         client.disconnect()

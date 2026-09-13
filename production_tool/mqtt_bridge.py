@@ -194,6 +194,7 @@ SCAN_DURATION_BASE = 4
 SCAN_RETRY_LIMIT = 7
 NO_RESPONSE_REJOIN_COUNT = 6
 DIRECT_JOIN_RETRY_INTERVAL = 1800
+DIRECT_JOIN_MARKER = "/data/local/mqtt_direct_join.last"
 _last_direct_join_at = 0
 
 # ---------------------------------------------------------------------------
@@ -361,9 +362,18 @@ def wisun_connect(fd, br_id, br_pwd, target_pan_id=None, target_channel=None, ta
     # A previously verified meter can be tried without waiting for a beacon.
     # Rate-limit this path because repeated PANA attempts can burden the meter.
     now = time.time()
+    try:
+        last_direct_join_at = max(_last_direct_join_at, os.path.getmtime(DIRECT_JOIN_MARKER))
+    except OSError:
+        last_direct_join_at = _last_direct_join_at
     if (target_pan_id and target_channel and target_addr and
-            now - _last_direct_join_at >= DIRECT_JOIN_RETRY_INTERVAL):
+            now - last_direct_join_at >= DIRECT_JOIN_RETRY_INTERVAL):
         _last_direct_join_at = now
+        try:
+            with open(DIRECT_JOIN_MARKER, "w") as marker:
+                marker.write(str(int(now)) + "\n")
+        except IOError as exc:
+            log("Could not persist direct join rate limit: {}".format(exc))
         log("Trying configured meter directly: Channel={} Pan ID={} Addr={}".format(
             target_channel, target_pan_id, target_addr))
         ipv6 = skll64(fd, target_addr)
@@ -381,7 +391,7 @@ def wisun_connect(fd, br_id, br_pwd, target_pan_id=None, target_channel=None, ta
                         target_channel, target_pan_id))
                     return ipv6
                 if "EVENT 24" in line:
-                    log("Direct SKJOIN authentication failed (EVENT 24)")
+                    log("Direct SKJOIN PANA connection failed (EVENT 24)")
                     break
             else:
                 log("Direct SKJOIN timed out")
@@ -455,7 +465,7 @@ def wisun_connect(fd, br_id, br_pwd, target_pan_id=None, target_channel=None, ta
                     join_success = True
                     return ipv6
                 if "EVENT 24" in line:
-                    log("SKJOIN: PANA authentication failed (EVENT 24) for PAN [{}/{}]: Channel={} Pan ID={}".format(
+                    log("SKJOIN: PANA connection failed (EVENT 24) for PAN [{}/{}]: Channel={} Pan ID={}".format(
                         idx + 1, len(pan_candidates), channel, pan_id))
                     break
         finally:

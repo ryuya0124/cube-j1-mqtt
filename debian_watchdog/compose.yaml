@@ -16,6 +16,8 @@ services:
     volumes:
       - ./data:/data
       - ./secrets/mqtt.json:/run/secrets/mqtt.json:ro
+      - ./secrets/cube_ssh_key:/run/secrets/cube_ssh_key:ro
+      - ./secrets/cube_known_hosts:/run/secrets/cube_known_hosts:ro
     environment:
       TZ: Asia/Tokyo
       CUBE_IP: 192.168.3.33
