@@ -15,6 +15,7 @@ from datetime import datetime
 import paho.mqtt.client as mqtt
 
 from policy import Policy
+from tapo_power import TapoPowerController
 
 
 DATA = Path("/data")
@@ -22,6 +23,7 @@ STATE = DATA / "state.json"
 SECRET = Path("/run/secrets/mqtt.json")
 SSH_KEY = Path("/run/secrets/cube_ssh_key")
 SSH_KNOWN_HOSTS = Path("/run/secrets/cube_known_hosts")
+TAPO_SECRET = Path("/run/secrets/tapo.json")
 CUBE_IP = os.environ.get("CUBE_IP", "192.168.3.33")
 SERIAL = CUBE_IP + ":5555"
 
@@ -95,7 +97,11 @@ def recover_ssh(action):
         raise ValueError(action)
 
 
-def recover(action):
+def recover(action, tapo):
+    if action == "power_cycle":
+        import asyncio
+        result = asyncio.run(tapo.power_cycle())
+        return "tapo_local", result
     try:
         connection = adb("connect", SERIAL, timeout=12)
         if "failed" in connection.lower() or "unable" in connection.lower():
@@ -106,7 +112,7 @@ def recover(action):
     except Exception as exc:
         event("adb_unavailable", error=str(exc)[:240], fallback="ssh")
         recover_ssh(action)
-        return "ssh"
+        return "ssh", None
 
     if action == "bridge":
         adb("-s", SERIAL, "shell", "setprop", "ctl.restart", "mqtt_ha_bridge", timeout=10)
@@ -114,7 +120,7 @@ def recover(action):
         adb("-s", SERIAL, "reboot", timeout=10)
     else:
         raise ValueError(action)
-    return "adb"
+    return "adb", None
 
 
 def main():
@@ -123,6 +129,13 @@ def main():
                 RotatingFileHandler(DATA / "events.jsonl", maxBytes=10_000_000, backupCount=5)]
     logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=handlers)
     config = json.loads(SECRET.read_text())
+    tapo_error = None
+    try:
+        tapo = TapoPowerController.from_path(TAPO_SECRET) if TAPO_SECRET.exists() \
+            else TapoPowerController({})
+    except Exception as exc:
+        tapo = TapoPowerController({})
+        tapo_error = "{}: {}".format(type(exc).__name__, str(exc)[:160])
     policy_config = {
         "stale_after": int(os.environ.get("STALE_AFTER", "600")),
         "bridge_grace": int(os.environ.get("BRIDGE_GRACE", "420")),
@@ -130,8 +143,17 @@ def main():
         "cooldown": int(os.environ.get("COOLDOWN", "3600")),
         "max_bridge_per_day": int(os.environ.get("MAX_BRIDGE_PER_DAY", "4")),
         "max_reboot_per_day": int(os.environ.get("MAX_REBOOT_PER_DAY", "2")),
+        "power_cycle_grace": int(os.environ.get("POWER_CYCLE_GRACE", "900")),
+        "max_power_cycle_per_day": int(os.environ.get("MAX_POWER_CYCLE_PER_DAY", "4")),
+        "power_cycle_min_interval": int(os.environ.get("POWER_CYCLE_MIN_INTERVAL", "21600")),
+        "power_cycle_enabled": tapo.armed,
     }
     saved = json.loads(STATE.read_text()) if STATE.exists() else {}
+    if tapo.armed and not bool(saved.get("power_cycle_enabled", False)):
+        # Enabling a new plug must start a fresh recovery ladder. A persisted
+        # reboot_wait state must never cause an immediate first power cut.
+        saved["phase"] = "normal"
+        saved["phase_at"] = 0
     policy = Policy.from_saved(policy_config, saved)
     lock = threading.Lock()
     started_at = time.time()
@@ -146,7 +168,8 @@ def main():
     last_status_at = 0
     cube_status = {}
     event("agent_started", topic=topic, status_topic=status_topic, cube=CUBE_IP,
-          thresholds=policy_config, phase=policy.phase)
+          thresholds=policy_config, phase=policy.phase,
+          smart_plug_armed=tapo.armed, smart_plug_config_error=tapo_error)
 
     def on_connect(client, userdata, flags, reason_code, properties):
         nonlocal broker_since
@@ -273,17 +296,27 @@ def main():
                 save_state(policy)
             event("recovery_requested", action=action, reason=reason)
             try:
-                method = recover(action)
+                method, details = recover(action, tapo)
             except Exception as exc:
                 with lock:
-                    policy.action_failed(action, time.time())
+                    if getattr(exc, "relay_was_touched", False):
+                        # Count an ambiguous relay attempt so it cannot repeat early.
+                        policy.action_succeeded(action, time.time())
+                    else:
+                        policy.action_failed(action, time.time())
                     save_state(policy)
-                event("recovery_failed", action=action, error=str(exc)[:240])
+                event("recovery_failed", action=action, error=str(exc)[:240],
+                      relay_was_touched=bool(getattr(exc, "relay_was_touched", False)))
             else:
                 with lock:
                     policy.action_succeeded(action, time.time())
                     save_state(policy)
-                event("recovery_command_sent", action=action, method=method)
+                safe_details = None
+                if details:
+                    safe_details = {key: value for key, value in details.items()
+                                    if key not in {"device_id"}}
+                event("recovery_command_sent", action=action, method=method,
+                      details=safe_details)
     finally:
         client.loop_stop()
         client.disconnect()

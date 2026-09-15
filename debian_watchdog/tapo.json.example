@@ -1,0 +1,16 @@
+{
+  "enabled": false,
+  "allow_power_off": "",
+  "host": "",
+  "username": "",
+  "password": "",
+  "expected_model": "P110M",
+  "expected_mac": "",
+  "expected_device_id": "",
+  "expected_alias": "Cube J1 power",
+  "forbidden_macs": [],
+  "forbidden_device_ids": [],
+  "off_seconds": 15,
+  "on_attempts": 6,
+  "on_retry_seconds": 5
+}

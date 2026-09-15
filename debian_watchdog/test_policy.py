@@ -13,7 +13,7 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(p.decide(140, broker_since=0, started_at=0)[0], "reboot")
         p.start_action("reboot", 140)
         self.assertEqual(p.decide(200, broker_since=0, started_at=0)[1],
-                         "reboot grace expired; cooling down")
+                         "reboot grace expired; smart-plug recovery is not armed")
         self.assertTrue(p.observe(201))
         self.assertEqual(p.phase, "normal")
         self.assertEqual(p.decide(250, broker_since=0, started_at=0)[0], None)
@@ -35,6 +35,51 @@ class PolicyTest(unittest.TestCase):
         self.assertIsNone(p.decide(10, broker_since=0, started_at=0)[0])
         self.assertEqual(p.phase, "cooldown")
         self.assertGreaterEqual(p.cooldown_until, 2 + 24 * 3600)
+
+    def test_power_cycle_only_when_explicitly_enabled(self):
+        p = Policy(stale_after=10, bridge_grace=20, reboot_grace=30,
+                   power_cycle_enabled=False)
+        p.start_action("reboot", 100)
+        action, reason = p.decide(130, broker_since=0, started_at=0)
+        self.assertIsNone(action)
+        self.assertIn("not armed", reason)
+
+        p = Policy(stale_after=10, bridge_grace=20, reboot_grace=30,
+                   power_cycle_grace=40, power_cycle_enabled=True)
+        p.start_action("reboot", 100)
+        self.assertEqual(p.decide(130, broker_since=0, started_at=0)[0],
+                         "power_cycle")
+        p.start_action("power_cycle", 130)
+        self.assertEqual(p.decide(169, broker_since=0, started_at=0)[0], None)
+        self.assertIn("power-cycle grace expired", p.decide(
+            170, broker_since=0, started_at=0)[1])
+
+    def test_power_cycle_daily_limit(self):
+        p = Policy(stale_after=1, reboot_grace=1, power_cycle_enabled=True,
+                   max_power_cycle_per_day=1)
+        p.start_action("power_cycle", 2)
+        p.action_succeeded("power_cycle", 2)
+        p.observe(3)
+        p.start_action("reboot", 4)
+        self.assertIsNone(p.decide(5, broker_since=0, started_at=0)[0])
+        self.assertEqual(p.phase, "cooldown")
+
+    def test_power_cycle_requires_six_hour_interval(self):
+        p = Policy(stale_after=1, reboot_grace=1, power_cycle_enabled=True,
+                   max_power_cycle_per_day=4, power_cycle_min_interval=21600)
+        p.start_action("power_cycle", 2)
+        p.action_succeeded("power_cycle", 2)
+        p.observe(3)
+        p.start_action("reboot", 100)
+        action, reason = p.decide(101, broker_since=0, started_at=0)
+        self.assertIsNone(action)
+        self.assertIn("minimum interval", reason)
+        self.assertEqual(p.cooldown_until, 21602)
+
+        p.phase = "reboot_wait"
+        p.phase_at = 21602
+        self.assertEqual(p.decide(21603, broker_since=0, started_at=0)[0],
+                         "power_cycle")
 
     def test_responsive_radio_scan_defers_restarts(self):
         p = Policy(stale_after=100, cooldown=3600)
