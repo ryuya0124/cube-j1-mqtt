@@ -3,8 +3,14 @@
 # Local last-resort supervisor. It uses only Android's bundled shell tools and
 # never touches the Wi-SUN serial port itself.
 
+PATH=/system/bin:/system/xbin:/sbin:/usr/bin:/usr/sbin:/bin
+export PATH
+TZ=JST-9
+export TZ
+
 LOG=/data/local/cube_j1_watchdog.log
 HEALTH=/tmp/mqtt_bridge.health
+PIDFILE=/tmp/cube_j1_watchdog.pid
 STATE=/data/local/cube_j1_watchdog.state
 LAST_REBOOT=/data/local/cube_j1_watchdog.last_reboot
 CONFIG=/data/local/config.json
@@ -13,6 +19,15 @@ RADIO_STALE=1800
 RESTART_WINDOW=10800
 RESTART_LIMIT=3
 REBOOT_COOLDOWN=21600
+
+if [ -s "$PIDFILE" ]; then
+    old_pid="$(cat "$PIDFILE" 2>/dev/null)"
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+        exit 0
+    fi
+fi
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' 0
 
 log() {
     now_text="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -36,7 +51,7 @@ mtime() {
 }
 
 bridge_running() {
-    ps 2>/dev/null | grep '[m]qtt_bridge.py' >/dev/null 2>&1
+    [ "$(getprop init.svc.mqtt_ha_bridge 2>/dev/null)" = running ]
 }
 
 wifi_ip() {

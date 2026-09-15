@@ -55,7 +55,9 @@ stop cube_j1_watchdog 2>/dev/null || true
 sleep 1
 start cube_j1_watchdog
 sleep 1
-if ! ps 2>/dev/null | grep '[c]ube_j1_watchdog.sh' >/dev/null 2>&1; then
+watchdog_pid="$(cat /tmp/cube_j1_watchdog.pid 2>/dev/null)"
+if [ "$(getprop init.svc.cube_j1_watchdog 2>/dev/null)" != running ] && \
+   { [ -z "$watchdog_pid" ] || ! kill -0 "$watchdog_pid" 2>/dev/null; }; then
     /system/bin/sh /data/local/cube_j1_watchdog.sh </dev/null >/dev/null 2>&1 &
 fi
 

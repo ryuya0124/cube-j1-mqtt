@@ -103,10 +103,13 @@ def rotate_bridge_log():
 def set_health(state=None, mqtt=None, meter=False, radio=False, detail=None):
     """Persist a small, secret-free status record for the local supervisor."""
     now = int(time.time())
+    error = None
     with _health_lock:
         if state is not None:
             _health["state"] = state
             _health["progress_at"] = now
+            if detail is None:
+                _health.pop("detail", None)
         if mqtt is not None:
             _health["mqtt"] = 1 if mqtt else 0
         if meter:
@@ -118,15 +121,17 @@ def set_health(state=None, mqtt=None, meter=False, radio=False, detail=None):
         record = dict(_health)
         record["heartbeat_at"] = now
         record["pid"] = os.getpid()
-    tmp = HEALTH_PATH + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            json.dump(record, f, separators=(",", ":"), sort_keys=True)
-            f.write("\n")
-            f.flush()
-        os.rename(tmp, HEALTH_PATH)
-    except Exception as exc:
-        log("Health file update failed: {}".format(exc))
+        tmp = HEALTH_PATH + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(record, f, separators=(",", ":"), sort_keys=True)
+                f.write("\n")
+                f.flush()
+            os.rename(tmp, HEALTH_PATH)
+        except Exception as exc:
+            error = exc
+    if error is not None:
+        log("Health file update failed: {}".format(error))
 
 def health_heartbeat():
     next_status_at = 0
@@ -1089,7 +1094,6 @@ def main():
                     tid = (tid + 1) & 0xFFFF
                     data = read_erxudp(fd, timeout=15)
                     if data:
-                        consecutive_no_response = 0
                         props = parse_el_response(data)
                         m     = decode_measurements(props)
                         m     = apply_energy_scale(m, coeff, unit_kwh)
@@ -1106,13 +1110,24 @@ def main():
                         sensor_keys = ("power_w", "energy_forward_kwh", "energy_reverse_kwh",
                                        "current_r_a", "current_t_a")
                         snapshot = {k: m[k] for k in sensor_keys if k in m}
-                        now = time.time()
-                        if (snapshot != last_published_measurements or
-                                now - last_measurements_publish_at >= force_publish_interval):
-                            publish_measurements(mqtt, device_id, m)
-                            last_published_measurements = snapshot
-                            last_measurements_publish_at = now
-                        set_health("meter_poll", meter=True)
+                        if snapshot:
+                            consecutive_no_response = 0
+                            now = time.time()
+                            if (snapshot != last_published_measurements or
+                                    now - last_measurements_publish_at >= force_publish_interval):
+                                publish_measurements(mqtt, device_id, m)
+                                last_published_measurements = snapshot
+                                last_measurements_publish_at = now
+                            set_health("meter_poll", meter=True)
+                        else:
+                            consecutive_no_response += 1
+                            set_health("meter_timeout", detail="empty ECHONET response {}/{}".format(
+                                consecutive_no_response, NO_RESPONSE_REJOIN_COUNT))
+                            log("ECHONET response had no measurement properties (consecutive={}/{})".format(
+                                consecutive_no_response, NO_RESPONSE_REJOIN_COUNT))
+                            if consecutive_no_response >= NO_RESPONSE_REJOIN_COUNT:
+                                raise RuntimeError("{} consecutive empty ECHONET responses".format(
+                                    consecutive_no_response))
                     else:
                         consecutive_no_response += 1
                         set_health("meter_timeout",
