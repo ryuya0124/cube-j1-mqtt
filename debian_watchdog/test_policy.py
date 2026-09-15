@@ -29,6 +29,7 @@ class PolicyTest(unittest.TestCase):
     def test_daily_limit_survives_reload(self):
         p = Policy(stale_after=1, max_bridge_per_day=1)
         p.start_action("bridge", 2)
+        p.action_succeeded("bridge", 2)
         p.observe(3)
         p = Policy.from_saved({"stale_after": 1, "max_bridge_per_day": 1}, p.saved())
         self.assertIsNone(p.decide(10, broker_since=0, started_at=0)[0])
@@ -44,6 +45,20 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(p.actions, [])
         p.observe(1001)
         self.assertEqual(p.phase, "normal")
+
+    def test_failed_action_does_not_use_daily_allowance(self):
+        p = Policy(stale_after=1, max_bridge_per_day=1)
+        p.start_action("bridge", 2)
+        p.action_failed("bridge", 3)
+        self.assertEqual(p.actions, [])
+        self.assertEqual(p.decide(904, broker_since=0, started_at=0)[0], "bridge")
+
+    def test_successful_action_uses_daily_allowance(self):
+        p = Policy(stale_after=1, max_bridge_per_day=1)
+        p.start_action("bridge", 2)
+        p.action_succeeded("bridge", 2)
+        p.observe(3)
+        self.assertIsNone(p.decide(4, broker_since=0, started_at=0)[0])
 
 
 if __name__ == "__main__":

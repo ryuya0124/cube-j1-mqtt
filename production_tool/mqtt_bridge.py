@@ -21,8 +21,16 @@ import collections
 import re
 import threading
 
+try:
+    # Cube J1 has little RAM. This is sufficient for the shallow helper
+    # threads used for heartbeat and LED blinking.
+    threading.stack_size(128 * 1024)
+except Exception:
+    pass
+
 CONFIG_PATH = "/data/local/config.json"
 LOG_PATH    = "/data/local/mqtt_bridge.log"
+HEALTH_PATH = "/tmp/mqtt_bridge.health"
 
 LED_R = "/sys/class/leds/red/brightness"
 LED_G = "/sys/class/leds/green/brightness"
@@ -47,6 +55,18 @@ def led_read():
     return tuple(result)
 
 _log_file = None
+_last_measurement_log_at = 0
+_health_lock = threading.Lock()
+_status_mqtt = None
+_status_device_id = None
+_health = {
+    "state": "starting",
+    "mqtt": 0,
+    "meter_at": 0,
+    "radio_at": 0,
+    "progress_at": 0,
+    "started_at": int(time.time()),
+}
 
 def log(msg):
     # 日本時間 (JST: UTC+9) でタイムスタンプを生成
@@ -63,6 +83,68 @@ def log(msg):
     else:
         sys.stderr.write(line)
         sys.stderr.flush()
+
+def rotate_bridge_log():
+    try:
+        if os.path.getsize(LOG_PATH) <= 2 * 1024 * 1024:
+            return
+        try:
+            os.remove(LOG_PATH + ".2")
+        except OSError:
+            pass
+        try:
+            os.rename(LOG_PATH + ".1", LOG_PATH + ".2")
+        except OSError:
+            pass
+        os.rename(LOG_PATH, LOG_PATH + ".1")
+    except OSError:
+        pass
+
+def set_health(state=None, mqtt=None, meter=False, radio=False, detail=None):
+    """Persist a small, secret-free status record for the local supervisor."""
+    now = int(time.time())
+    with _health_lock:
+        if state is not None:
+            _health["state"] = state
+            _health["progress_at"] = now
+        if mqtt is not None:
+            _health["mqtt"] = 1 if mqtt else 0
+        if meter:
+            _health["meter_at"] = now
+        if radio:
+            _health["radio_at"] = now
+        if detail is not None:
+            _health["detail"] = str(detail)[:120]
+        record = dict(_health)
+        record["heartbeat_at"] = now
+        record["pid"] = os.getpid()
+    tmp = HEALTH_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(record, f, separators=(",", ":"), sort_keys=True)
+            f.write("\n")
+            f.flush()
+        os.rename(tmp, HEALTH_PATH)
+    except Exception as exc:
+        log("Health file update failed: {}".format(exc))
+
+def health_heartbeat():
+    next_status_at = 0
+    while True:
+        set_health()
+        now = time.time()
+        if _status_mqtt is not None and now >= next_status_at:
+            try:
+                publish_status(_status_mqtt, _status_device_id)
+            except Exception as exc:
+                log("MQTT status publish failed: {}".format(exc))
+            next_status_at = now + 60
+        time.sleep(30)
+
+def start_health_heartbeat():
+    thread = threading.Thread(target=health_heartbeat)
+    thread.daemon = True
+    thread.start()
 
 def load_config():
     with open(CONFIG_PATH) as f:
@@ -184,6 +266,9 @@ def skcommand(fd, cmd, timeout=10):
         stop_event.set()
         t.join(timeout=1)
         led_rgb(*orig_led)
+    if lines:
+        # Even an echo or FAIL proves the UART and Wi-SUN firmware answered.
+        set_health(radio=True)
     return lines
 
 # ---------------------------------------------------------------------------
@@ -206,6 +291,7 @@ def skscan(fd, expected_pair_id, target_pan_id=None, target_channel=None, target
     duration = SCAN_DURATION_BASE
     
     while duration <= SCAN_RETRY_LIMIT:
+        set_health("wisun_scan", detail="duration={}".format(duration))
         # Clear stale lines from previous command/scan cycle.
         termios.tcflush(fd, termios.TCIFLUSH)
 
@@ -229,7 +315,8 @@ def skscan(fd, expected_pair_id, target_pan_id=None, target_channel=None, target
             if line is None:
                 continue
             line_clean = line.strip()
-            if line_clean:
+            if line_clean.startswith("EVENT"):
+                set_health(radio=True)
                 # The raw scan can contain neighboring meters' identifiers.
                 if line_clean.startswith(("Pan ID:", "Addr:", "PairID:")):
                     log("SCAN < {} [redacted]".format(line_clean.split(":", 1)[0] + ":"))
@@ -352,6 +439,7 @@ def skll64(fd, mac):
 def wisun_connect(fd, br_id, br_pwd, target_pan_id=None, target_channel=None, target_addr=None):
     """Full SKSTACK-IP join sequence. Returns IPv6 address of meter."""
     global _last_direct_join_at
+    set_health("wisun_initializing")
     log("Initializing Wi-SUN module...")
     skcommand(fd, "SKRESET", timeout=5)
     time.sleep(1)
@@ -379,6 +467,7 @@ def wisun_connect(fd, br_id, br_pwd, target_pan_id=None, target_channel=None, ta
             log("Could not persist direct join rate limit: {}".format(exc))
         log("Trying configured meter directly: Channel={} Pan ID={} Addr={}".format(
             target_channel, target_pan_id, target_addr))
+        set_health("wisun_direct_join")
         ipv6 = skll64(fd, target_addr)
         if ipv6:
             skcommand(fd, "SKSREG S2 {}".format(target_channel))
@@ -442,6 +531,7 @@ def wisun_connect(fd, br_id, br_pwd, target_pan_id=None, target_channel=None, ta
         skcommand(fd, "SKSREG S3 {}".format(pan_id))
 
         log("SKJOIN {} (Channel={} Pan ID={})".format(ipv6, channel, pan_id))
+        set_health("wisun_join")
         serial_write(fd, "SKJOIN {}\r\n".format(ipv6))
 
         orig_led = led_read()
@@ -591,6 +681,7 @@ def read_erxudp(fd, timeout=15):
         if line is None:
             continue
         if line.startswith("ERXUDP"):
+            set_health(radio=True)
             parts = line.split()
             # Tail fields are stable: ... <secured> <side> <datalen> <data>
             if len(parts) >= 10:
@@ -624,14 +715,18 @@ def _encode_str(s):
     return struct.pack(">H", len(b)) + b
 
 class MQTTClient(object):
-    def __init__(self, host, port, client_id, username=None, password=None):
+    def __init__(self, host, port, client_id, username=None, password=None,
+                 will_topic=None, will_payload=None):
         self.host      = host
         self.port      = port
         self.client_id = client_id
         self.username  = username
         self.password  = password
+        self.will_topic = will_topic
+        self.will_payload = will_payload
         self.sock      = None
         self._out_queue = collections.deque()
+        self._socket_lock = threading.RLock()
 
     def connect(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -652,6 +747,8 @@ class MQTTClient(object):
         s.connect((self.host, self.port))
 
         flags = 0x02  # clean session
+        if self.will_topic:
+            flags |= 0x04 | 0x20  # Will flag + retained Will
         if self.username: flags |= 0x80
         if self.password: flags |= 0x40
 
@@ -661,6 +758,9 @@ class MQTTClient(object):
                    + b"\x00\x3C")   # keep-alive 60s
 
         payload = _encode_str(self.client_id)
+        if self.will_topic:
+            payload += _encode_str(self.will_topic)
+            payload += _encode_str(self.will_payload or "offline")
         if self.username: payload += _encode_str(self.username)
         if self.password: payload += _encode_str(self.password)
 
@@ -685,6 +785,7 @@ class MQTTClient(object):
             raise RuntimeError("MQTT: connection refused code {}".format(rc))
 
         self.sock = s
+        set_health(mqtt=True)
         log("MQTT connected to {}:{}".format(self.host, self.port))
 
         # flush any queued messages
@@ -706,33 +807,41 @@ class MQTTClient(object):
     def publish(self, topic, payload, retain=False):
         pkt = self._make_pkt(topic, payload, retain)
         try:
-            if not self.sock:
-                raise RuntimeError("No MQTT socket")
-            self.sock.sendall(pkt)
+            with self._socket_lock:
+                if not self.sock:
+                    raise RuntimeError("No MQTT socket")
+                self.sock.sendall(pkt)
             return
         except Exception as e:
             log("MQTT publish error: {}".format(e))
-            # try reconnect and resend
+            set_health(mqtt=False)
+            # One bounded reconnect attempt keeps Wi-SUN recovery progressing
+            # even when the Debian broker itself is down.
             try:
                 self._reconnect()
             except Exception as e2:
                 log("MQTT reconnect failed after publish error: {}".format(e2))
                 # queue the message for later delivery
-                try:
-                    self._out_queue.append((topic, payload, retain))
-                except Exception:
-                    pass
+                self._queue(topic, payload, retain)
                 return
 
             try:
-                self.sock.sendall(pkt)
+                with self._socket_lock:
+                    self.sock.sendall(pkt)
                 return
             except Exception as e3:
                 log("MQTT publish retry failed: {}".format(e3))
-                try:
-                    self._out_queue.append((topic, payload, retain))
-                except Exception:
-                    pass
+                set_health(mqtt=False)
+                self._queue(topic, payload, retain)
+
+    def _queue(self, topic, payload, retain):
+        # Keep only the newest value per topic and bound memory during a long
+        # Debian/MQTT outage. Replaying old power samples would fake liveness.
+        self._out_queue = collections.deque(
+            item for item in self._out_queue if item[0] != topic)
+        while len(self._out_queue) >= 100:
+            self._out_queue.popleft()
+        self._out_queue.append((topic, payload, retain))
 
     def _flush_queue(self):
         while self._out_queue and self.sock:
@@ -747,10 +856,11 @@ class MQTTClient(object):
 
     def ping(self):
         try:
-            self.sock.sendall(b"\xC0\x00")
+            with self._socket_lock:
+                self.sock.sendall(b"\xC0\x00")
         except Exception as e:
             log("MQTT ping error: {}".format(e))
-            self._reconnect()
+            self._reconnect_quiet()
             return
         # wait for PINGRESP (should be 0xD0 0x00)
         try:
@@ -759,37 +869,42 @@ class MQTTClient(object):
                 resp = self.sock.recv(2)
                 if not resp:
                     log("MQTT ping: no response (empty)")
-                    self._reconnect()
+                    self._reconnect_quiet()
                 elif len(resp) < 2:
                     log("MQTT ping: incomplete response (len={})".format(len(resp)))
-                    self._reconnect()
+                    self._reconnect_quiet()
                 else:
                     first_byte = resp[0] if isinstance(resp[0], int) else ord(resp[0])
                     if first_byte != 0xD0:
                         log("MQTT ping: unexpected response first_byte=0x{:02X}".format(first_byte))
-                        self._reconnect()
+                        self._reconnect_quiet()
             else:
                 log("MQTT ping: timeout (no data within 5s)")
-                self._reconnect()
+                self._reconnect_quiet()
         except Exception as e:
             log("MQTT ping recv error: {}".format(e))
+            self._reconnect_quiet()
+
+    def _reconnect_quiet(self):
+        try:
             self._reconnect()
+        except Exception as exc:
+            log("MQTT reconnect deferred: {}".format(exc))
 
     def _reconnect(self):
-        log("MQTT reconnecting …")
-        try:
-            if self.sock:
-                self.sock.close()
-        except Exception:
-            pass
-        self.sock = None
-        while True:
+        with self._socket_lock:
+            log("MQTT reconnecting …")
+            try:
+                if self.sock:
+                    self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
             try:
                 self.connect()
-                return
-            except Exception as e:
-                log("MQTT reconnect failed: {} - retry in 15s".format(e))
-                time.sleep(15)
+            except Exception:
+                set_health(mqtt=False)
+                raise
 
 # ---------------------------------------------------------------------------
 # Home Assistant MQTT auto-discovery
@@ -820,6 +935,9 @@ def publish_ha_discovery(mqtt, device_id):
             "unit_of_measurement": unit,
             "device_class":       dev_class,
             "state_class":        state_class,
+            "availability_topic": "{}/availability".format(base),
+            "payload_available":  "online",
+            "payload_not_available": "offline",
             "device":             device,
         }
         mqtt.publish(topic, config, retain=True)
@@ -838,12 +956,37 @@ def publish_measurements(mqtt, device_id, m):
     if "current_t_a" in m:
         mqtt.publish("{}/current_t".format(base), "{:.1f}".format(m["current_t_a"]))
 
+def health_snapshot():
+    with _health_lock:
+        status = dict(_health)
+    status["heartbeat_at"] = int(time.time())
+    status["pid"] = os.getpid()
+    try:
+        with open("/proc/uptime") as f:
+            status["uptime_s"] = int(float(f.read().split()[0]))
+    except Exception:
+        pass
+    return status
+
+def publish_status(mqtt, device_id):
+    base = "cubej/{}".format(device_id)
+    mqtt.publish(base + "/availability", "online", retain=True)
+    mqtt.publish(base + "/status", health_snapshot(), retain=True)
+
+def sleep_with_health(seconds, state, detail=None):
+    set_health(state, detail=detail)
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        time.sleep(min(30, max(1, deadline - time.time())))
+        set_health()
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
-    global _log_file
+    global _log_file, _last_measurement_log_at, _status_mqtt, _status_device_id
+    rotate_bridge_log()
     try:
         _log_file = open(LOG_PATH, "a")
         _log_file.write("\n\n" + "=" * 80 + "\n")
@@ -851,6 +994,7 @@ def main():
     except Exception:
         pass
 
+    start_health_heartbeat()
     cfg           = load_config()
     br_id         = cfg["br_id"]
     br_pwd        = cfg["br_pwd"]
@@ -861,6 +1005,7 @@ def main():
     device_id     = cfg.get("device_id", "cubej1")
     serial_port   = cfg.get("serial_port", "/dev/ttyS1")
     poll_interval = int(cfg.get("poll_interval", 60))
+    force_publish_interval = int(cfg.get("force_publish_interval", 60))
     target_pan_id = cfg.get("target_pan_id") or cfg.get("pan_id")
     target_channel= cfg.get("target_channel") or cfg.get("channel")
     target_addr   = cfg.get("target_addr") or cfg.get("addr")
@@ -870,105 +1015,133 @@ def main():
     log("================================================================================")
 
     # Connect MQTT
+    base = "cubej/{}".format(device_id)
     mqtt = MQTTClient(ha_host, ha_port, "cubej1_{}".format(device_id),
-                      username=ha_user, password=ha_pass)
+                      username=ha_user, password=ha_pass,
+                      will_topic=base + "/availability", will_payload="offline")
     while True:
         try:
+            set_health("mqtt_connect", mqtt=False)
             mqtt.connect()
             break
         except Exception as e:
             log("MQTT connect failed: {} - retry in 15s".format(e))
-            time.sleep(15)
+            sleep_with_health(15, "mqtt_wait", str(e))
 
     publish_ha_discovery(mqtt, device_id)
+    publish_status(mqtt, device_id)
+    _status_mqtt = mqtt
+    _status_device_id = device_id
+    last_published_measurements = {}
+    last_measurements_publish_at = 0
 
     # Open serial port
     log("Opening serial {}".format(serial_port))
     fd = None
-    while True:
-        try:
-            fd = open_serial(serial_port)
-            break
-        except Exception as e:
-            log("Serial open failed: {} - retry in 10s".format(e))
-            time.sleep(10)
-
-    # Wi-SUN join
-    ipv6 = None
     join_failures = 0
     while True:
+        if fd is None:
+            try:
+                set_health("serial_open")
+                fd = open_serial(serial_port)
+            except Exception as e:
+                log("Serial open failed: {} - retry in 30s".format(e))
+                sleep_with_health(30, "serial_wait", str(e))
+                continue
+
         try:
             ipv6 = wisun_connect(fd, br_id, br_pwd,
                                  target_pan_id=target_pan_id,
                                  target_channel=target_channel,
                                  target_addr=target_addr)
-            break
         except Exception as e:
             join_failures += 1
             # A missing meter can persist for hours. Avoid continuous radio
             # scanning and repeated module resets during a long outage.
             retry_after = min(60 * (2 ** min(join_failures - 1, 4)), 900)
             log("Wi-SUN join failed: {} - retry in {}s".format(e, retry_after))
-            time.sleep(retry_after)
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            fd = None
+            sleep_with_health(retry_after, "wisun_backoff",
+                              "join failure {}; retry {}s".format(join_failures, retry_after))
+            continue
 
-    log("Meter connected at {}".format(ipv6))
+        join_failures = 0
+        log("Meter connected at {}".format(ipv6))
+        set_health("meter_connected")
 
-    tid       = 1
-    coeff     = 1
-    unit_kwh  = 1.0
-    last_ping = time.time()
-    consecutive_no_response = 0
+        tid       = 1
+        coeff     = 1
+        unit_kwh  = 1.0
+        last_ping = time.time()
+        consecutive_no_response = 0
 
-    while True:
         try:
-            orig_led = led_read()
-            led_rgb(0, 0, 255)
-            try:
-                send_el_get(fd, ipv6, tid)
-                tid = (tid + 1) & 0xFFFF
-                data = read_erxudp(fd, timeout=15)
-                if data:
-                    consecutive_no_response = 0
-                    props = parse_el_response(data)
-                    m     = decode_measurements(props)
-                    m     = apply_energy_scale(m, coeff, unit_kwh)
-                    if "coefficient" in m:
-                        coeff = m["coefficient"]
-                    if "unit_kwh" in m:
-                        unit_kwh = m["unit_kwh"]
-                    log("Measurements: {}".format(
-                        {k: v for k, v in m.items()
-                         if k in ("power_w", "energy_forward_kwh", "energy_reverse_kwh",
-                                   "current_r_a", "current_t_a")}))
-                    publish_measurements(mqtt, device_id, m)
-                else:
-                    consecutive_no_response += 1
-                    log("No ERXUDP response (timeout; consecutive={}/{})".format(
-                        consecutive_no_response, NO_RESPONSE_REJOIN_COUNT))
-                    if consecutive_no_response >= NO_RESPONSE_REJOIN_COUNT:
-                        raise RuntimeError("{} consecutive meter response timeouts".format(
-                            consecutive_no_response))
-            finally:
-                led_rgb(*orig_led)
+            while True:
+                set_health("meter_poll")
+                orig_led = led_read()
+                led_rgb(0, 0, 255)
+                try:
+                    send_el_get(fd, ipv6, tid)
+                    tid = (tid + 1) & 0xFFFF
+                    data = read_erxudp(fd, timeout=15)
+                    if data:
+                        consecutive_no_response = 0
+                        props = parse_el_response(data)
+                        m     = decode_measurements(props)
+                        m     = apply_energy_scale(m, coeff, unit_kwh)
+                        if "coefficient" in m:
+                            coeff = m["coefficient"]
+                        if "unit_kwh" in m:
+                            unit_kwh = m["unit_kwh"]
+                        if time.time() - _last_measurement_log_at >= 300:
+                            log("Measurements: {}".format(
+                                {k: v for k, v in m.items()
+                                 if k in ("power_w", "energy_forward_kwh", "energy_reverse_kwh",
+                                           "current_r_a", "current_t_a")}))
+                            _last_measurement_log_at = time.time()
+                        sensor_keys = ("power_w", "energy_forward_kwh", "energy_reverse_kwh",
+                                       "current_r_a", "current_t_a")
+                        snapshot = {k: m[k] for k in sensor_keys if k in m}
+                        now = time.time()
+                        if (snapshot != last_published_measurements or
+                                now - last_measurements_publish_at >= force_publish_interval):
+                            publish_measurements(mqtt, device_id, m)
+                            last_published_measurements = snapshot
+                            last_measurements_publish_at = now
+                        set_health("meter_poll", meter=True)
+                    else:
+                        consecutive_no_response += 1
+                        set_health("meter_timeout",
+                                   detail="{}/{}".format(consecutive_no_response,
+                                                         NO_RESPONSE_REJOIN_COUNT))
+                        log("No ERXUDP response (timeout; consecutive={}/{})".format(
+                            consecutive_no_response, NO_RESPONSE_REJOIN_COUNT))
+                        if consecutive_no_response >= NO_RESPONSE_REJOIN_COUNT:
+                            raise RuntimeError("{} consecutive meter response timeouts".format(
+                                consecutive_no_response))
+                finally:
+                    led_rgb(*orig_led)
 
-            if time.time() - last_ping > 50:
-                mqtt.ping()
-                last_ping = time.time()
+                if time.time() - last_ping > 50:
+                    mqtt.ping()
+                    last_ping = time.time()
 
-            time.sleep(poll_interval)
-
+                sleep_with_health(poll_interval, "meter_wait")
         except Exception as e:
-            log("Main loop error: {} - reconnecting Wi-SUN in 30s".format(e))
-            time.sleep(30)
+            join_failures += 1
+            retry_after = min(60 * (2 ** min(join_failures - 1, 4)), 900)
+            log("Main loop error: {} - rebuilding Wi-SUN connection in {}s".format(
+                e, retry_after))
             try:
-                ipv6 = wisun_connect(fd, br_id, br_pwd,
-                                     target_pan_id=target_pan_id,
-                                     target_channel=target_channel,
-                                     target_addr=target_addr)
-                consecutive_no_response = 0
-                log("Wi-SUN reconnected at {}".format(ipv6))
-            except Exception as e2:
-                log("Wi-SUN reconnect failed: {}".format(e2))
+                os.close(fd)
+            except Exception:
+                pass
+            fd = None
+            sleep_with_health(retry_after, "wisun_backoff", str(e))
 
 
 if __name__ == "__main__":

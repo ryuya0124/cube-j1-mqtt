@@ -138,7 +138,15 @@ def main():
     broker_since = None
     last_saved_sample = 0
     topic = config.get("topic", "cubej/cubej1/power")
-    event("agent_started", topic=topic, cube=CUBE_IP, thresholds=policy_config, phase=policy.phase)
+    status_topic = config.get("status_topic", "cubej/cubej1/status")
+    status_stale = int(os.environ.get("CUBE_STATUS_STALE", "180"))
+    self_recovery_grace = int(os.environ.get("CUBE_SELF_RECOVERY_GRACE", "1800"))
+    max_radio_deferrals = int(os.environ.get("MAX_RADIO_DEFERRALS", "2"))
+    radio_status_stale = int(os.environ.get("RADIO_STATUS_STALE", "1200"))
+    last_status_at = 0
+    cube_status = {}
+    event("agent_started", topic=topic, status_topic=status_topic, cube=CUBE_IP,
+          thresholds=policy_config, phase=policy.phase)
 
     def on_connect(client, userdata, flags, reason_code, properties):
         nonlocal broker_since
@@ -147,8 +155,9 @@ def main():
             return
         with lock:
             broker_since = time.time()
-        result, _ = client.subscribe(topic, qos=0)
-        event("mqtt_connected", subscribe_result=int(result), topic=topic)
+        result, _ = client.subscribe([(topic, 0), (status_topic, 0)])
+        event("mqtt_connected", subscribe_result=int(result), topic=topic,
+              status_topic=status_topic)
 
     def on_disconnect(client, userdata, flags, reason_code, properties):
         nonlocal broker_since
@@ -159,7 +168,22 @@ def main():
             event("mqtt_disconnected", reason=str(reason_code))
 
     def on_message(client, userdata, message):
-        nonlocal last_saved_sample
+        nonlocal last_saved_sample, last_status_at, cube_status
+        if message.topic == status_topic:
+            try:
+                status = json.loads(message.payload)
+                heartbeat_at = float(status.get("heartbeat_at", 0))
+                now = time.time()
+                if abs(now - heartbeat_at) > status_stale:
+                    return
+                with lock:
+                    last_status_at = now
+                    cube_status = status
+            except (ValueError, TypeError, UnicodeDecodeError):
+                return
+            return
+        if message.topic != topic:
+            return
         if message.retain:
             return
         try:
@@ -202,15 +226,45 @@ def main():
                 event("recovery_deferred", reason=reason, until=policy.cooldown_until)
             if not action:
                 continue
-            if radio_search_active():
+            with lock:
+                status_age = time.time() - last_status_at if last_status_at else float("inf")
+                status_state = str(cube_status.get("state", ""))
+                radio_at = float(cube_status.get("radio_at", 0) or 0)
+                anchor = max(policy.last_message_at, broker_since or 0, started_at)
+                outage_age = time.time() - anchor
+            cube_alive = status_age <= status_stale
+            radio_age = time.time() - radio_at if radio_at else float("inf")
+            cube_radio_active = cube_alive and radio_age <= radio_status_stale and status_state in {
+                "wisun_initializing", "wisun_direct_join", "wisun_scan", "wisun_join",
+                "wisun_backoff", "meter_timeout", "serial_open", "serial_wait"
+            }
+            if action == "bridge" and cube_alive and outage_age < self_recovery_grace:
                 with lock:
                     current, _ = policy.decide(time.time(), broker_since, started_at)
                     if current == action:
+                        policy.defer_for_cube_recovery(time.time())
+                        save_state(policy)
+                        event("recovery_deferred",
+                              reason="Cube heartbeat is fresh; allowing local recovery",
+                              action=action, cube_state=status_state,
+                              status_age_s=int(status_age), until=policy.cooldown_until)
+                continue
+            radio_active = cube_radio_active
+            if not radio_active and not cube_alive:
+                radio_active = radio_search_active()
+            if radio_active:
+                with lock:
+                    current, _ = policy.decide(time.time(), broker_since, started_at)
+                    can_defer = policy.radio_deferrals < max_radio_deferrals
+                    if current == action and can_defer:
                         policy.defer_for_radio_search(time.time())
                         save_state(policy)
-                        event("recovery_deferred", reason="Wi-SUN scan is responsive; meter not found",
-                              action=action, until=policy.cooldown_until)
-                continue
+                        event("recovery_deferred",
+                              reason="Wi-SUN recovery is responsive; bounded deferral",
+                              action=action, cube_state=status_state or "remote_log",
+                              radio_age_s=int(radio_age) if math.isfinite(radio_age) else None,
+                              deferrals=policy.radio_deferrals, until=policy.cooldown_until)
+                        continue
             with lock:
                 current, reason = policy.decide(time.time(), broker_since, started_at)
                 if current != action:
@@ -226,6 +280,9 @@ def main():
                     save_state(policy)
                 event("recovery_failed", action=action, error=str(exc)[:240])
             else:
+                with lock:
+                    policy.action_succeeded(action, time.time())
+                    save_state(policy)
                 event("recovery_command_sent", action=action, method=method)
     finally:
         client.loop_stop()

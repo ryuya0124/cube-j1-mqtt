@@ -22,7 +22,9 @@ sleep 5
 # copy config and bridge script to /data/local (always writable)
 cp $PT/config.json    /data/local/config.json
 cp $PT/mqtt_bridge.py /data/local/mqtt_bridge.py
+cp $PT/cube_j1_watchdog.sh /data/local/cube_j1_watchdog.sh
 chmod 755 /data/local/mqtt_bridge.py
+chmod 755 /data/local/cube_j1_watchdog.sh
 
 # make root filesystem writable so we can update init RC files
 mount -o rw,remount /
@@ -38,6 +40,7 @@ cp $PT/ndeclite_disabled.rc /system/etc/init/ndeclite_agent.rc
 
 # install our MQTT bridge as an init service (auto-start on next boot)
 cp $PT/mqtt_ha_bridge.rc /system/etc/init/mqtt_ha_bridge.rc
+cp $PT/cube_j1_watchdog.rc /system/etc/init/cube_j1_watchdog.rc
 
 # ── Stop conflicting services immediately ──────────────────────────────────────
 stop wisund
@@ -48,6 +51,13 @@ sleep 2
 stop mqtt_ha_bridge 2>/dev/null || true
 sleep 1
 start mqtt_ha_bridge
+stop cube_j1_watchdog 2>/dev/null || true
+sleep 1
+start cube_j1_watchdog
+sleep 1
+if ! ps 2>/dev/null | grep '[c]ube_j1_watchdog.sh' >/dev/null 2>&1; then
+    /system/bin/sh /data/local/cube_j1_watchdog.sh </dev/null >/dev/null 2>&1 &
+fi
 
 # ── Finish LED (blink white) ───────────────────────────────────────────────
 cp $PT/led_effect.sh /data/local/led_effect.sh

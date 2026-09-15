@@ -19,6 +19,7 @@ class Policy:
     cooldown_until: float = 0
     last_message_at: float = 0
     actions: list = field(default_factory=list)
+    radio_deferrals: int = 0
 
     @classmethod
     def from_saved(cls, config, saved):
@@ -31,12 +32,14 @@ class Policy:
         obj.last_message_at = float(saved.get("last_message_at", 0))
         obj.actions = [a for a in saved.get("actions", [])
                        if a.get("type") in ("bridge", "reboot") and isinstance(a.get("at"), (int, float))]
+        obj.radio_deferrals = int(saved.get("radio_deferrals", 0))
         return obj
 
     def saved(self):
         return {"phase": self.phase, "phase_at": self.phase_at,
                 "cooldown_until": self.cooldown_until,
-                "last_message_at": self.last_message_at, "actions": self.actions}
+                "last_message_at": self.last_message_at, "actions": self.actions,
+                "radio_deferrals": self.radio_deferrals}
 
     def observe(self, now):
         previous = self.phase
@@ -44,6 +47,7 @@ class Policy:
         self.phase = "normal"
         self.phase_at = now
         self.cooldown_until = 0
+        self.radio_deferrals = 0
         return previous != "normal"
 
     def decide(self, now, broker_since, started_at):
@@ -82,9 +86,12 @@ class Policy:
         return action, reason
 
     def start_action(self, action, now):
-        self.actions.append({"type": action, "at": now})
         self.phase = "bridge_wait" if action == "bridge" else "reboot_wait"
         self.phase_at = now
+
+    def action_succeeded(self, action, now):
+        """Only commands that reached Cube count against the daily limit."""
+        self.actions.append({"type": action, "at": now})
 
     def action_failed(self, action, now):
         expected = "bridge_wait" if action == "bridge" else "reboot_wait"
@@ -94,6 +101,13 @@ class Policy:
 
     def defer_for_radio_search(self, now):
         """Let a responsive Wi-SUN scan continue without restarting Cube."""
+        self.radio_deferrals += 1
+        self.phase = "cooldown"
+        self.phase_at = now
+        self.cooldown_until = now + min(self.cooldown, 900)
+
+    def defer_for_cube_recovery(self, now):
+        """Give Cube's own supervisor one short window before intervening."""
         self.phase = "cooldown"
         self.phase_at = now
         self.cooldown_until = now + min(self.cooldown, 900)
