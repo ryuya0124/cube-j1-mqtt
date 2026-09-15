@@ -1101,18 +1101,15 @@ def main():
                             coeff = m["coefficient"]
                         if "unit_kwh" in m:
                             unit_kwh = m["unit_kwh"]
-                        if time.time() - _last_measurement_log_at >= 300:
-                            log("Measurements: {}".format(
-                                {k: v for k, v in m.items()
-                                 if k in ("power_w", "energy_forward_kwh", "energy_reverse_kwh",
-                                           "current_r_a", "current_t_a")}))
-                            _last_measurement_log_at = time.time()
                         sensor_keys = ("power_w", "energy_forward_kwh", "energy_reverse_kwh",
                                        "current_r_a", "current_t_a")
                         snapshot = {k: m[k] for k in sensor_keys if k in m}
                         if snapshot:
                             consecutive_no_response = 0
                             now = time.time()
+                            if now - _last_measurement_log_at >= 300:
+                                log("Measurements: {}".format(snapshot))
+                                _last_measurement_log_at = now
                             if (snapshot != last_published_measurements or
                                     now - last_measurements_publish_at >= force_publish_interval):
                                 publish_measurements(mqtt, device_id, m)
