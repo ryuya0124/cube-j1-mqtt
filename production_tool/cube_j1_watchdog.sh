@@ -42,6 +42,13 @@ rotate_log() {
     fi
 }
 
+log_resources() {
+    read load1 rest < /proc/loadavg
+    cpu_khz="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null)"
+    mem_free_kb="$(awk '/^MemFree:|^Buffers:|^Cached:/ { total += $2 } END { print total + 0 }' /proc/meminfo)"
+    log "resources: cpu_khz=${cpu_khz:-unknown} load1=${load1:-unknown} free_cache_kb=$mem_free_kb"
+}
+
 epoch() {
     date +%s
 }
@@ -103,6 +110,7 @@ restart_count=0
 window_at=0
 wifi_missing_since=0
 last_wifi_reconfigure=0
+last_resource_log=0
 
 if [ -s "$STATE" ]; then
     read restart_count window_at wifi_missing_since last_wifi_reconfigure < "$STATE"
@@ -113,11 +121,18 @@ wifi_missing_since="${wifi_missing_since:-0}"
 last_wifi_reconfigure="${last_wifi_reconfigure:-0}"
 
 log "local watchdog started"
+log "temperature unavailable: Cube kernel exposes no sensor; BP35C0 has no temperature command"
+log_resources
+last_resource_log="$(epoch)"
 sleep 180
 
 while true; do
     now="$(epoch)"
     rotate_log
+    if [ $((now - last_resource_log)) -ge 900 ]; then
+        log_resources
+        last_resource_log="$now"
+    fi
     restart_sshd
     if [ "$(getprop init.svc.adbd 2>/dev/null)" != running ]; then
         start adbd
